@@ -9,6 +9,7 @@ pub struct BuildingPlacement {
     pub goods_yard_group_id: Option<u32>,
     pub stockpile_resource: Option<StockpileResource>,
     pub entry_point: Option<EntryPoint>,
+    pub wheat_layout: u8,
     pub footprint: Footprint,
     pub components: Vec<BuildingComponent>,
 }

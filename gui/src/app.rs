@@ -51,6 +51,30 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .lock()
                     .expect("editor state lock should not be poisoned");
                 state.set_simulator(update.simulator);
+                if let Some(calculated) = update.cycle_settings {
+                    let current = state.simulation_settings();
+                    if (
+                        calculated.fear_factor,
+                        calculated.optimized_fletcher_routing,
+                        calculated.fletchers_weapon,
+                        calculated.poleturners_weapon,
+                        calculated.blacksmiths_weapon,
+                    ) != (
+                        current.fear_factor,
+                        current.optimized_fletcher_routing,
+                        current.fletchers_weapon,
+                        current.poleturners_weapon,
+                        current.blacksmiths_weapon,
+                    ) {
+                        state.mark_simulation_results_stale();
+                        refresh_geometry_view(
+                            &window,
+                            &state,
+                            "Waiting for current production settings...",
+                        );
+                        return;
+                    }
+                }
                 if let Some(cycle_rows) = update.cycle_rows {
                     state.set_cycle_rows(cycle_rows);
                     refresh_view(&window, &state, &update.message);
@@ -141,12 +165,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let weak_window = window.as_weak();
     let state_for_place = Arc::clone(&state);
     let backend_for_place = backend.clone();
-    window.on_place_at(move |x, y| {
+    window.on_place_at(move |x, y, remove_whole_wall| {
         if let Some(window) = weak_window.upgrade() {
             let mut state = state_for_place
                 .lock()
                 .expect("editor state lock should not be poisoned");
-            match state.place_selected(x, y) {
+            match state.place_selected(x, y, remove_whole_wall) {
                 Ok(PlacementOutcome::Status(message)) => {
                     refresh_geometry_view(&window, &state, &message);
                 }
@@ -922,17 +946,25 @@ fn refresh_simulation_view(window: &MainWindow, state: &EditorState) {
                 .map(|ticks| format!("{:.2}", ticks as f64 / state.game_speed() as f64))
                 .unwrap_or_else(|| "-".to_string());
             let weapon = row.weapon_type.display_name().to_string();
-            let note = match (row.travel_ticks, row.make_ticks, row.error.as_ref()) {
-                (Some(travel_ticks), Some(make_ticks), _) => {
+            let note = match (row.travel_ticks, row.work_ticks, row.error.as_ref()) {
+                (Some(travel_ticks), Some(work_ticks), _) => {
                     format!(
-                        "Travel: {} ticks, craft: {} ticks, avg output: {:.2}",
-                        travel_ticks, make_ticks, row.average_weapons_per_cycle
+                        "Travel: {} ticks, work/handling: {} ticks, avg output: {:.2}",
+                        travel_ticks, work_ticks, row.average_weapons_per_cycle
                     )
                 }
                 (_, _, Some(error)) => error.clone(),
                 _ => "No cycle data".to_string(),
             };
 
+            let note = if let Some(timing) = row.timing {
+                format!(
+                    "{} | repeated {}-{} ticks",
+                    note, timing.min_ticks, timing.max_ticks
+                )
+            } else {
+                note
+            };
             SimulationCycleItem {
                 workshop: row.workshop_name.clone().into(),
                 weapon: weapon.into(),
@@ -1536,6 +1568,9 @@ fn effective_workshop_gold_per_minute(
 }
 
 fn build_hover_simulation_info(state: &EditorState) -> (String, String, Vec<String>) {
+    if state.simulation_results_stale() {
+        return (String::new(), String::new(), Vec::new());
+    }
     let Some(building) = state.hovered_building() else {
         return (String::new(), String::new(), Vec::new());
     };
@@ -1566,7 +1601,7 @@ fn build_bread_hover_info(
     let report = state
         .simulator()
         .calculate_bread_economy(state.simulation_settings());
-    let lines = match building.building_type {
+    let mut lines = match building.building_type {
         simulator::BuildingType::WheatFarm => report
             .farm_rates
             .iter()
@@ -1601,11 +1636,41 @@ fn build_bread_hover_info(
         _ => Vec::new(),
     };
 
+    let rates = match building.building_type {
+        BuildingType::WheatFarm => &report.farm_rates,
+        BuildingType::Windmill => &report.mill_rates,
+        BuildingType::Bakery => &report.bakery_rates,
+        _ => &report.farm_rates,
+    };
+    if let Some(rate) = rates.iter().find(|rate| rate.building_id == building.id) {
+        lines.extend(cycle_timing_lines(rate.timing));
+    }
+    if building.building_type == BuildingType::WheatFarm {
+        lines.push(format!(
+            "Field layout: {} (36 crop cells)",
+            building.wheat_layout + 1
+        ));
+    }
     (
         format!("#{} {}", building.id, building.building_type.display_name()),
         String::new(),
         lines,
     )
+}
+
+fn cycle_timing_lines(timing: simulator::CycleTiming) -> Vec<String> {
+    vec![
+        format!("Mean output cycle: {:.2} ticks", timing.mean_ticks),
+        format!(
+            "Repeated intervals: {}-{} ticks",
+            timing.min_ticks, timing.max_ticks
+        ),
+        format!(
+            "First modelled complete batch: {} ticks",
+            timing.first_delivery_ticks
+        ),
+        "Flat ground; no crowd delay. Cycle capacity assumes available input and storage.".into(),
+    ]
 }
 
 fn goods_output_lines(goods_name: &str, actual_per_minute: f64, sell_gold: f64) -> Vec<String> {
@@ -1660,13 +1725,16 @@ fn build_workshop_hover_info(
                 total_ticks,
                 total_ticks as f64 / state.game_speed() as f64
             ));
-            if let (Some(travel_ticks), Some(make_ticks)) = (row.travel_ticks, row.make_ticks) {
+            if let (Some(travel_ticks), Some(work_ticks)) = (row.travel_ticks, row.work_ticks) {
                 lines.push(format!(
-                    "Travel: {} ticks | Craft: {} ticks",
-                    travel_ticks, make_ticks
+                    "Travel: {} ticks | Work/handling: {} ticks",
+                    travel_ticks, work_ticks
                 ));
             }
 
+            if let Some(timing) = row.timing {
+                lines.extend(cycle_timing_lines(timing));
+            }
             lines.push(format!(
                 "Average output / cycle: {:.2}",
                 row.average_weapons_per_cycle
@@ -1906,7 +1974,8 @@ mod tests {
             armoury_id: Some(2),
             total_ticks: Some(1_000),
             travel_ticks: Some(0),
-            make_ticks: Some(1_000),
+            work_ticks: Some(1_000),
+            timing: None,
             average_weapons_per_cycle: 1.0,
             wood_per_cycle: 0,
             iron_per_cycle: 1,

@@ -98,6 +98,70 @@ pub(crate) fn shortest_path_len(
     None
 }
 
+/// A concrete shortest route for crop approaches; ties prefer the target direction.
+/// Native terrain, crowd/substep delays are outside the flat-map planner.
+pub(super) fn crop_route(
+    map: &CellMap,
+    start: EntryPoint,
+    target: EntryPoint,
+    trim: bool,
+) -> Option<(u32, EntryPoint)> {
+    if start == target {
+        return Some((0, start));
+    }
+    if !map.is_in_bounds(start.x, start.y)
+        || !map.is_in_bounds(target.x, target.y)
+        || map.is_blocked(start.x, start.y)
+        || map.is_blocked(target.x, target.y)
+    {
+        return None;
+    }
+    let mut parents = vec![usize::MAX; map.width() * map.height()];
+    let mut queue = VecDeque::from([(start, 0_u32)]);
+    let start_index = map.index(start.x, start.y)?;
+    parents[start_index] = start_index;
+    while let Some((point, distance)) = queue.pop_front() {
+        // Y is up in the editor and down in the native crop tables.
+        let mut offsets = [
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+            (-1, 0),
+            (1, 0),
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+        ];
+        offsets.sort_by_key(|(dx, dy)| {
+            let x = i64::from(point.x + dx) - i64::from(target.x);
+            let y = i64::from(point.y + dy) - i64::from(target.y);
+            x * x + y * y
+        });
+        for (dx, dy) in offsets {
+            let next = EntryPoint {
+                x: point.x + dx,
+                y: point.y + dy,
+            };
+            let Some(index) = map.index(next.x, next.y) else {
+                continue;
+            };
+            if map.is_blocked(next.x, next.y) || parents[index] != usize::MAX {
+                continue;
+            }
+            parents[index] = map.index(point.x, point.y)?;
+            if next == target {
+                return if trim {
+                    Some((distance, point))
+                } else {
+                    Some((distance + 1, target))
+                };
+            }
+            queue.push_back((next, distance + 1));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{CellMap, EntryPoint};

@@ -1,0 +1,41 @@
+{
+  "date": "2026-10-19",
+  "purpose": "Preserve the current empirical model before a future native upgrade; runtime remains unchanged.",
+  "weapon_work_ticks": {
+    "Bow": 625,
+    "Crossbow": 555,
+    "Spear": 290,
+    "Pike": 872,
+    "Sword": 1090,
+    "Mace": 910,
+    "Armor": 585
+  },
+  "bread": {
+    "wheat_work_ticks": 6950,
+    "farm_deliveries_per_nominal_cycle": 12,
+    "mill_processing_ticks": 312,
+    "mill_workers": 3,
+    "bakery_work_ticks": 1700,
+    "farm_loaded_ticks_per_tile": 16,
+    "farm_empty_ticks_per_tile": 12,
+    "mill_ticks_per_tile_all_legs": 16,
+    "baker_ticks_per_tile": 24
+  },
+  "assumptions": [
+    "Worker trips calculated from cached entry-to-entry path lengths.",
+    "First matching designated input stockpile; shortest Bakery/Granary loop.",
+    "Ten-cycle weapon fear ring; linear aggregate farm/bread yields.",
+    "Simulator::tick advances the clock without advancing worker/crop/inventory states."
+  ],
+  "source_sha256": {
+    "simulator/src/simulation/production_cycle.rs": "7ac2a676e5d260f9f1ac9c96e8f1b51c2791f9c00180dd732024262beeebb4d7",
+    "simulator/src/simulation/bread.rs": "b5c290962d967926f441c03e069869d35f1c21d3bf6cbbc981f51ac3257b714e",
+    "simulator/src/simulation/pathfinding.rs": "2af6b1d57e8e6ae865d6bc07981d50305918fe943cb06ba1f42d0a5924f92781",
+    "simulator/src/simulation/entry_logic.rs": "d8e64e2ac38b1618d6b4bf7c43456366ec5b1629ecb24a84479c8f4fea66548e",
+    "simulator/src/simulation/simulator.rs": "eca4d9064d19d32779657bbecdea5f48077df36962146a7c03e4f0f9ca9551ae",
+    "simulator/src/buildings/footprint.rs": "0be947f2d34b1264f0fff8ff59d9a9863b37f98e7ba60d270b5a27ffb2fb2fa6",
+    "simulator/src/project.rs": "2b2656ecbcd6a03885cc65f8672858f6215592f77403dd02ee4161c724320140",
+    "doc/simulation_model.md": "996fc45d9b0646653360907db2dfafa591dbb75e0c9ce297abfbbadff2b23cf6"
+  },
+  "older_weapon_backup": "weapon_animation_ticks_before_dll_update_2026-10-14.json"
+}

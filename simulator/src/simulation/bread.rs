@@ -1,19 +1,13 @@
 use std::collections::HashMap;
 
-use crate::buildings::{BuildingPlacement, BuildingType, StockpileResource};
+use crate::{
+    CellMap,
+    buildings::{BuildingPlacement, BuildingType, StockpileResource},
+};
 
-use super::{BuildingDistance, DistanceKey, SimulationSettings};
-
-pub const WHEAT_FARM_WORK_TICKS: u64 = 6_950;
-pub const WHEAT_FARM_WALKS_PER_CYCLE: u32 = 12;
-pub const MILL_PROCESS_TICKS: u64 = 312;
-pub const MILL_WORKER_COUNT: u32 = 3;
-pub const BAKERY_WORK_TICKS: u64 = 1_700;
-
-const FARM_LOADED_TICKS_PER_CELL: u64 = 16;
-const FARM_EMPTY_TICKS_PER_CELL: u64 = 12;
-const MILL_TICKS_PER_CELL: u64 = 16;
-const BAKERY_TICKS_PER_CELL: u64 = 24;
+use super::cycle_timing::{bakery_cycle, mill_cycle};
+use super::wheat_cycle::wheat_cycle;
+use super::{BuildingDistance, CycleTiming, DistanceKey, SimulationSettings};
 
 pub const WHEAT_SELL_GOLD: f64 = 8.0;
 pub const WHEAT_BUY_GOLD: f64 = 23.0;
@@ -27,6 +21,7 @@ pub struct BreadBuildingRate {
     pub building_id: u32,
     pub capacity_per_minute: f64,
     pub actual_per_minute: f64,
+    pub timing: CycleTiming,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,96 +49,152 @@ pub struct BreadEconomyReport {
     pub issues: Vec<String>,
 }
 
-pub(crate) fn calculate_bread_economy(
+#[derive(Debug, Clone)]
+struct Capacity {
+    building_id: u32,
+    per_tick: f64,
+    timing: CycleTiming,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct BreadCapacities {
+    farms: Vec<Capacity>,
+    mills: Vec<Capacity>,
+    bakeries: Vec<Capacity>,
+    farm_count: usize,
+    mill_count: usize,
+    bakery_count: usize,
+    granary_count: usize,
+    issues: Vec<String>,
+}
+
+pub(super) fn calculate_capacities(
+    map: &CellMap,
     buildings: &[BuildingPlacement],
     distances: &HashMap<DistanceKey, BuildingDistance>,
-    settings: SimulationSettings,
-) -> BreadEconomyReport {
+    fear: i32,
+) -> BreadCapacities {
     let farms = buildings_of_type(buildings, BuildingType::WheatFarm);
     let mills = buildings_of_type(buildings, BuildingType::Windmill);
     let bakeries = buildings_of_type(buildings, BuildingType::Bakery);
     let granaries = buildings_of_type(buildings, BuildingType::Granary);
     let wheat_stock = stockpile(buildings, StockpileResource::Wheat);
     let flour_stock = stockpile(buildings, StockpileResource::Flour);
-    let mut issues = Vec::new();
-
+    let mut result = BreadCapacities {
+        farm_count: farms.len(),
+        mill_count: mills.len(),
+        bakery_count: bakeries.len(),
+        granary_count: granaries.len(),
+        ..BreadCapacities::default()
+    };
     if wheat_stock.is_none() {
-        issues.push("No stockpile is marked for Wheat".to_string());
+        result
+            .issues
+            .push("No stockpile is marked for Wheat".into());
     }
     if flour_stock.is_none() {
-        issues.push("No stockpile is marked for Flour".to_string());
+        result
+            .issues
+            .push("No stockpile is marked for Flour".into());
     }
     if granaries.is_empty() {
-        issues.push("No Granary placed".to_string());
+        result.issues.push("No Granary placed".into());
     }
+    if let Some(stock) = wheat_stock {
+        for farm in farms {
+            if route_distance(distances, farm.id, stock.id, &mut result.issues).is_none() {
+                continue;
+            }
+            let timing = stock
+                .entry_point
+                .and_then(|entry| wheat_cycle(map, farm, entry, fear));
+            if let Some(timing) = timing {
+                result.farms.push(Capacity {
+                    building_id: farm.id,
+                    per_tick: timing.output_per_tick(),
+                    timing,
+                });
+            } else {
+                result.issues.push(format!(
+                    "Wheat Farm #{} cannot finish its crop/stock routes",
+                    farm.id
+                ));
+            }
+        }
+    }
+    if let (Some(wheat), Some(flour)) = (wheat_stock, flour_stock) {
+        for mill in mills {
+            let legs = route_distance(distances, flour.id, wheat.id, &mut result.issues)
+                .zip(route_distance(
+                    distances,
+                    wheat.id,
+                    mill.id,
+                    &mut result.issues,
+                ))
+                .zip(route_distance(
+                    distances,
+                    mill.id,
+                    flour.id,
+                    &mut result.issues,
+                ));
+            if let Some(((empty, loaded_in), loaded_out)) = legs {
+                let timing = mill_cycle(
+                    u64::from(empty) * 12,
+                    u64::from(loaded_in) * 16,
+                    u64::from(loaded_out) * 16,
+                );
+                result.mills.push(Capacity {
+                    building_id: mill.id,
+                    per_tick: timing.output_per_tick(),
+                    timing,
+                });
+            }
+        }
+    }
+    if let Some(flour) = flour_stock {
+        for bakery in bakeries {
+            // Stock/native granary selection uses ascending building slots, not the shortest loop.
+            let granary = granaries.iter().min_by_key(|granary| granary.id);
+            let legs = granary.and_then(|granary| {
+                distance(distances, granary.id, flour.id)
+                    .zip(distance(distances, flour.id, bakery.id))
+                    .zip(distance(distances, bakery.id, granary.id))
+            });
+            if let Some(((empty, loaded_in), loaded_out)) = legs {
+                let timing = bakery_cycle(
+                    u64::from(loaded_in) * 24,
+                    u64::from(empty) * 24,
+                    u64::from(loaded_out) * 24,
+                    fear,
+                );
+                result.bakeries.push(Capacity {
+                    building_id: bakery.id,
+                    per_tick: 1.0 / timing.mean_ticks,
+                    timing,
+                });
+            } else {
+                result.issues.push(format!(
+                    "Bakery #{} has no reachable Flour stockpile and Granary route",
+                    bakery.id
+                ));
+            }
+        }
+    }
+    result
+}
 
+pub(super) fn calculate_bread_economy(
+    capacities: &BreadCapacities,
+    settings: SimulationSettings,
+) -> BreadEconomyReport {
     let wheat_per_farm_cycle = wheat_output_per_farm_cycle(settings.fear_factor);
     let bread_per_flour = bread_output_per_flour(settings.fear_factor);
-
-    let farm_rates_per_tick = wheat_stock.map_or_else(Vec::new, |stock| {
-        farms
-            .iter()
-            .filter_map(|farm| {
-                let distance = route_distance(distances, farm.id, stock.id, &mut issues)?;
-                let travel_ticks = farm_travel_ticks(distance);
-                Some((
-                    farm.id,
-                    wheat_per_farm_cycle / (WHEAT_FARM_WORK_TICKS + travel_ticks) as f64,
-                ))
-            })
-            .collect()
-    });
-    let wheat_per_tick = sum_rates(&farm_rates_per_tick);
-
-    let mill_rates_per_tick = match (wheat_stock, flour_stock) {
-        (Some(wheat), Some(flour)) => mills
-            .iter()
-            .filter_map(|mill| {
-                let route_cells = route_distance(distances, flour.id, wheat.id, &mut issues)?
-                    + route_distance(distances, wheat.id, mill.id, &mut issues)?
-                    + route_distance(distances, mill.id, flour.id, &mut issues)?;
-                let worker_cycle_ticks =
-                    MILL_PROCESS_TICKS + u64::from(route_cells) * MILL_TICKS_PER_CELL;
-                Some((
-                    mill.id,
-                    mill_capacity_per_tick(worker_cycle_ticks - MILL_PROCESS_TICKS),
-                ))
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    let flour_capacity_per_tick = sum_rates(&mill_rates_per_tick);
-
-    let bakery_rates_per_tick = flour_stock.map_or_else(Vec::new, |flour| {
-        bakeries
-            .iter()
-            .filter_map(|bakery| {
-                let route_cells = granaries
-                    .iter()
-                    .filter_map(|granary| {
-                        let to_flour = distance(distances, granary.id, flour.id)?;
-                        let to_bakery = distance(distances, flour.id, bakery.id)?;
-                        let to_granary = distance(distances, bakery.id, granary.id)?;
-                        Some(to_flour + to_bakery + to_granary)
-                    })
-                    .min();
-
-                let Some(route_cells) = route_cells else {
-                    issues.push(format!(
-                        "Bakery #{} has no reachable Flour stockpile and Granary route",
-                        bakery.id
-                    ));
-                    return None;
-                };
-
-                let cycle_ticks =
-                    BAKERY_WORK_TICKS + u64::from(route_cells) * BAKERY_TICKS_PER_CELL;
-                Some((bakery.id, 1.0 / cycle_ticks as f64))
-            })
-            .collect()
-    });
-    let bakery_capacity_per_tick = sum_rates(&bakery_rates_per_tick);
-
+    let farm_rates_per_tick = &capacities.farms;
+    let mill_rates_per_tick = &capacities.mills;
+    let bakery_rates_per_tick = &capacities.bakeries;
+    let wheat_per_tick = sum_rates(farm_rates_per_tick);
+    let flour_capacity_per_tick = sum_rates(mill_rates_per_tick);
+    let bakery_capacity_per_tick = sum_rates(bakery_rates_per_tick);
     let farm_wheat_processed_per_tick = wheat_per_tick.min(flour_capacity_per_tick);
     let purchased_wheat_per_tick = if settings.buy_wheat {
         (bakery_capacity_per_tick - farm_wheat_processed_per_tick)
@@ -185,40 +236,41 @@ pub(crate) fn calculate_bread_economy(
         wheat_per_farm_cycle,
         bread_per_flour,
         limiting_stage,
-        farm_count: farms.len(),
-        mill_count: mills.len(),
-        bakery_count: bakeries.len(),
-        granary_count: granaries.len(),
-        farm_rates: allocate_rates(&farm_rates_per_tick, wheat_per_tick, ticks_per_minute),
-        mill_rates: allocate_rates(&mill_rates_per_tick, flour_per_tick, ticks_per_minute),
+        farm_count: capacities.farm_count,
+        mill_count: capacities.mill_count,
+        bakery_count: capacities.bakery_count,
+        granary_count: capacities.granary_count,
+        farm_rates: allocate_rates(farm_rates_per_tick, wheat_per_tick, ticks_per_minute),
+        mill_rates: allocate_rates(mill_rates_per_tick, flour_per_tick, ticks_per_minute),
         bakery_rates: allocate_rates(
-            &bakery_rates_per_tick,
+            bakery_rates_per_tick,
             bread_batches_per_tick,
             ticks_per_minute,
         ),
-        issues,
+        issues: capacities.issues.clone(),
     }
 }
 
-fn sum_rates(rates: &[(u32, f64)]) -> f64 {
-    rates.iter().map(|(_, rate)| rate).sum()
+fn sum_rates(rates: &[Capacity]) -> f64 {
+    rates.iter().map(|rate| rate.per_tick).sum()
 }
 
 fn allocate_rates(
-    rates: &[(u32, f64)],
+    rates: &[Capacity],
     actual_total_per_tick: f64,
     ticks_per_minute: f64,
 ) -> Vec<BreadBuildingRate> {
     let capacity_total = sum_rates(rates);
     rates
         .iter()
-        .map(|(building_id, capacity)| BreadBuildingRate {
-            building_id: *building_id,
-            capacity_per_minute: capacity * ticks_per_minute,
+        .map(|capacity| BreadBuildingRate {
+            building_id: capacity.building_id,
+            timing: capacity.timing,
+            capacity_per_minute: capacity.per_tick * ticks_per_minute,
             actual_per_minute: if capacity_total == 0.0 {
                 0.0
             } else {
-                actual_total_per_tick * capacity / capacity_total * ticks_per_minute
+                actual_total_per_tick * (capacity.per_tick / capacity_total) * ticks_per_minute
             },
         })
         .collect()
@@ -307,55 +359,14 @@ fn limiting_stage(
     }
 }
 
-fn mill_capacity_per_tick(travel_ticks: u64) -> f64 {
-    let worker_capacity = f64::from(MILL_WORKER_COUNT) / (MILL_PROCESS_TICKS + travel_ticks) as f64;
-    let processor_capacity = 1.0 / MILL_PROCESS_TICKS as f64;
-    worker_capacity.min(processor_capacity)
-}
-
-fn farm_travel_ticks(distance_cells: u32) -> u64 {
-    u64::from(distance_cells)
-        * (FARM_LOADED_TICKS_PER_CELL + FARM_EMPTY_TICKS_PER_CELL)
-        * u64::from(WHEAT_FARM_WALKS_PER_CYCLE)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        MILL_PROCESS_TICKS, WHEAT_FARM_WORK_TICKS, bread_output_per_flour, farm_travel_ticks,
-        mill_capacity_per_tick, wheat_output_per_farm_cycle,
-    };
-
+    use super::{bread_output_per_flour, wheat_output_per_farm_cycle};
     #[test]
-    fn fear_factor_linearly_changes_bread_and_wheat_output() {
+    fn productivity_changes_mean_integer_yield() {
         assert_eq!(wheat_output_per_farm_cycle(0), 24.0);
         assert_eq!(wheat_output_per_farm_cycle(-5), 36.0);
-        assert_eq!(wheat_output_per_farm_cycle(-2), 28.8);
         assert_eq!(bread_output_per_flour(0), 8.0);
         assert_eq!(bread_output_per_flour(-5), 12.0);
-        assert_eq!(bread_output_per_flour(-2), 9.6);
-    }
-
-    #[test]
-    fn mill_capacity_respects_single_processor_and_three_workers() {
-        assert_eq!(mill_capacity_per_tick(0), 1.0 / MILL_PROCESS_TICKS as f64);
-        assert_eq!(mill_capacity_per_tick(1_000), 3.0 / 1_312.0);
-    }
-
-    #[test]
-    fn wheat_farmer_returns_faster_when_empty() {
-        assert_eq!(farm_travel_ticks(1), 12 * (16 + 12));
-    }
-
-    #[test]
-    fn calibrated_three_farm_layout_produces_about_twenty_two_wheat_per_minute() {
-        let wheat_per_minute = [16, 4, 8]
-            .into_iter()
-            .map(|distance| {
-                24.0 / (WHEAT_FARM_WORK_TICKS + farm_travel_ticks(distance)) as f64 * 3_000.0
-            })
-            .sum::<f64>();
-
-        assert!((wheat_per_minute - 22.0).abs() < 0.05);
     }
 }

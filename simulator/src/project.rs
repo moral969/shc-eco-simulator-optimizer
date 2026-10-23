@@ -17,6 +17,8 @@ pub struct ProjectFile {
     #[serde(default)]
     pub bounds: Option<MapBounds>,
     pub buildings: Vec<SavedBuilding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_wheat_layout: Option<u8>,
     pub walls: Vec<WallSegment>,
     pub simulation: SimulationSettings,
     #[serde(default)]
@@ -32,6 +34,8 @@ pub struct SavedBuilding {
     pub goods_yard_group_id: Option<u32>,
     pub stockpile_resource: Option<StockpileResource>,
     pub entry_point: Option<EntryPoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wheat_layout: Option<u8>,
 }
 
 impl ProjectFile {
@@ -52,6 +56,7 @@ impl ProjectFile {
             walls: simulator.walls().to_vec(),
             simulation,
             population_economy,
+            next_wheat_layout: Some(simulator.next_wheat_layout()),
         }
     }
 
@@ -78,7 +83,10 @@ impl ProjectFile {
                 ));
             }
         };
-        let simulator = Simulator::from_saved_layout(bounds, self.buildings, self.walls)?;
+        let mut simulator = Simulator::from_saved_layout(bounds, self.buildings, self.walls)?;
+        if let Some(layout) = self.next_wheat_layout {
+            simulator.restore_next_wheat_layout(layout)?;
+        }
         Ok((
             simulator,
             self.simulation,
@@ -97,6 +105,8 @@ impl From<&BuildingPlacement> for SavedBuilding {
             goods_yard_group_id: building.goods_yard_group_id,
             stockpile_resource: building.stockpile_resource,
             entry_point: building.entry_point,
+            wheat_layout: (building.building_type == BuildingType::WheatFarm)
+                .then_some(building.wheat_layout),
         }
     }
 }
@@ -111,6 +121,7 @@ impl SavedBuilding {
             goods_yard_group_id: self.goods_yard_group_id,
             stockpile_resource: self.stockpile_resource,
             entry_point: self.entry_point,
+            wheat_layout: self.wheat_layout.unwrap_or(0),
             footprint: Footprint::for_type(self.building_type),
             components: Vec::new(),
         }
@@ -147,6 +158,47 @@ mod tests {
     };
 
     use super::{ProjectFile, SavedBuilding};
+
+    #[test]
+    fn wheat_layout_and_next_layout_survive_deletion_save_and_legacy_loading() {
+        let mut simulator = Simulator::new(60).expect("map");
+        simulator
+            .place_building(BuildingType::WheatFarm, 2, 2)
+            .expect("first farm");
+        simulator
+            .place_building(BuildingType::WheatFarm, 15, 2)
+            .expect("second farm");
+        assert_eq!(simulator.buildings()[0].wheat_layout, 0);
+        assert_eq!(simulator.buildings()[1].wheat_layout, 1);
+        simulator.remove_at(2, 2);
+        let project = ProjectFile::capture(
+            &simulator,
+            SimulationSettings::default(),
+            PopulationEconomySettings::default(),
+        );
+        let json = serde_json::to_value(project).expect("serialize");
+        let restored: ProjectFile = serde_json::from_value(json.clone()).expect("decode");
+        let (mut restored, _, _) = restored.into_simulator().expect("load");
+        assert_eq!(restored.buildings()[0].wheat_layout, 1);
+        restored
+            .place_building(BuildingType::WheatFarm, 28, 2)
+            .expect("third farm");
+        assert_eq!(restored.buildings()[1].wheat_layout, 0);
+
+        let mut legacy = json;
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("next_wheat_layout");
+        for building in legacy["buildings"].as_array_mut().expect("buildings") {
+            building
+                .as_object_mut()
+                .expect("building")
+                .remove("wheat_layout");
+        }
+        let legacy: ProjectFile = serde_json::from_value(legacy).expect("legacy decode");
+        assert!(legacy.into_simulator().is_ok());
+    }
 
     #[test]
     fn json_round_trip_preserves_layout_entry_points_and_settings() {
@@ -214,6 +266,33 @@ mod tests {
             .place_building(BuildingType::Armoury, 30, 30)
             .expect("new placement should work after loading");
         assert!(new_id > previous_max_id);
+    }
+
+    #[test]
+    fn json_round_trip_preserves_crossing_walls() {
+        let mut simulator = Simulator::new(30).expect("simulator should be created");
+        simulator
+            .place_wall(4, 10, 16, 10)
+            .expect("horizontal wall should be placed");
+        simulator
+            .place_wall(10, 4, 10, 16)
+            .expect("vertical wall should cross it");
+
+        let project = ProjectFile::capture(
+            &simulator,
+            SimulationSettings::default(),
+            PopulationEconomySettings::default(),
+        );
+        let json = serde_json::to_string_pretty(&project).expect("project should serialize");
+        let decoded: ProjectFile = serde_json::from_str(&json).expect("project should deserialize");
+        let (mut restored, _, _) = decoded
+            .into_simulator()
+            .expect("crossing walls should restore");
+
+        assert_eq!(restored.walls(), simulator.walls());
+        assert!(restored.is_cell_occupied(10, 10));
+        restored.remove_whole_wall_at(10, 10);
+        assert!(restored.is_cell_occupied(10, 10));
     }
 
     #[test]

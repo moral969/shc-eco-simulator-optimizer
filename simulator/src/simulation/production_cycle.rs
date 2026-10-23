@@ -5,8 +5,6 @@ use super::{BuildingDistance, DistanceKey};
 const TICKS_PER_CELL_FACTOR: u64 = 8;
 const MIN_FEAR_FACTOR: i32 = -5;
 const MAX_FEAR_FACTOR: i32 = 0;
-const WORKSHOP_FEAR_RING_LEN: usize = 10;
-const WORKSHOP_BASE_OUTPUT_RING: [u32; WORKSHOP_FEAR_RING_LEN] = [1, 2, 1, 2, 1, 2, 1, 2, 1, 2];
 pub const WOOD_BUY_GOLD: u32 = 4;
 pub const IRON_BUY_GOLD: u32 = 45;
 
@@ -54,7 +52,6 @@ impl WeaponType {
                 workshop_type: BuildingType::FletchersWorkshop,
                 wood_required: 2,
                 iron_required: 0,
-                make_time_ticks: 638,
                 sell_gold: 15,
             },
             Self::Crossbow => WeaponRecipe {
@@ -62,7 +59,6 @@ impl WeaponType {
                 workshop_type: BuildingType::FletchersWorkshop,
                 wood_required: 3,
                 iron_required: 0,
-                make_time_ticks: 565,
                 sell_gold: 30,
             },
             Self::Spear => WeaponRecipe {
@@ -70,7 +66,6 @@ impl WeaponType {
                 workshop_type: BuildingType::PoleturnersWorkshop,
                 wood_required: 1,
                 iron_required: 0,
-                make_time_ticks: 332,
                 sell_gold: 10,
             },
             Self::Pike => WeaponRecipe {
@@ -78,7 +73,6 @@ impl WeaponType {
                 workshop_type: BuildingType::PoleturnersWorkshop,
                 wood_required: 2,
                 iron_required: 0,
-                make_time_ticks: 872,
                 sell_gold: 18,
             },
             Self::Sword => WeaponRecipe {
@@ -86,7 +80,6 @@ impl WeaponType {
                 workshop_type: BuildingType::BlacksmithsWorkshop,
                 wood_required: 0,
                 iron_required: 1,
-                make_time_ticks: 1090,
                 sell_gold: 30,
             },
             Self::Mace => WeaponRecipe {
@@ -94,7 +87,6 @@ impl WeaponType {
                 workshop_type: BuildingType::BlacksmithsWorkshop,
                 wood_required: 0,
                 iron_required: 1,
-                make_time_ticks: 910,
                 sell_gold: 30,
             },
             Self::Armor => WeaponRecipe {
@@ -102,7 +94,6 @@ impl WeaponType {
                 workshop_type: BuildingType::ArmourersWorkshop,
                 wood_required: 0,
                 iron_required: 1,
-                make_time_ticks: 625,
                 sell_gold: 30,
             },
         }
@@ -115,7 +106,6 @@ pub struct WeaponRecipe {
     pub workshop_type: BuildingType,
     pub wood_required: u32,
     pub iron_required: u32,
-    pub make_time_ticks: u64,
     pub sell_gold: u32,
 }
 
@@ -179,9 +169,7 @@ impl SimulationSettings {
             return 0.0;
         }
 
-        let ring = workshop_fear_output_ring(self.fear_factor);
-        let total = ring.iter().sum::<u32>();
-        total as f64 / WORKSHOP_FEAR_RING_LEN as f64
+        1.5 + f64::from(clamped_fear_factor(self.fear_factor).unsigned_abs()) * 0.1
     }
 
     pub fn resource_buy_gold_per_cycle(self, recipe: WeaponRecipe) -> u32 {
@@ -204,21 +192,6 @@ pub fn clamped_fear_factor(fear_factor: i32) -> i32 {
     fear_factor.clamp(MIN_FEAR_FACTOR, MAX_FEAR_FACTOR)
 }
 
-pub fn workshop_fear_output_ring(fear_factor: i32) -> [u32; WORKSHOP_FEAR_RING_LEN] {
-    let mut ring = WORKSHOP_BASE_OUTPUT_RING;
-    let improved_one_count = clamped_fear_factor(fear_factor).unsigned_abs() as usize;
-
-    for output in ring
-        .iter_mut()
-        .filter(|output| **output == 1)
-        .take(improved_one_count)
-    {
-        *output = 2;
-    }
-
-    ring
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionRouteUsage {
     pub start_building_id: u32,
@@ -237,7 +210,8 @@ pub struct ProductionCycle {
     pub route_usage: Vec<ProductionRouteUsage>,
     pub travel_distance_cells: u32,
     pub travel_ticks: u64,
-    pub make_ticks: u64,
+    pub work_ticks: u64,
+    pub timing: super::CycleTiming,
     pub total_ticks: u64,
 }
 
@@ -255,13 +229,15 @@ impl ProductionCycle {
         workshop_id: u32,
         armoury_id: u32,
         route_usage: Vec<ProductionRouteUsage>,
+        timing: super::CycleTiming,
     ) -> Self {
         let travel_distance_cells = route_usage
             .iter()
             .map(|usage| usage.total_distance_cells)
             .sum();
         let travel_ticks = route_usage.iter().map(|usage| usage.total_ticks).sum();
-        let make_ticks = recipe.make_time_ticks;
+        let total_ticks = timing.mean_ticks.round() as u64;
+        let work_ticks = total_ticks.saturating_sub(travel_ticks);
 
         Self {
             recipe,
@@ -270,8 +246,9 @@ impl ProductionCycle {
             route_usage,
             travel_distance_cells,
             travel_ticks,
-            make_ticks,
-            total_ticks: travel_ticks + make_ticks,
+            work_ticks,
+            total_ticks,
+            timing,
         }
     }
 }
@@ -402,10 +379,7 @@ pub(crate) fn travel_ticks_for_distance(building_type: BuildingType, distance_ce
 mod tests {
     use crate::buildings::{BuildingType, WORKSHOP_SLOWDOWN_BASE};
 
-    use super::{
-        SimulationSettings, WeaponType, clamped_fear_factor, travel_ticks_for_distance,
-        workshop_fear_output_ring,
-    };
+    use super::{SimulationSettings, WeaponType, clamped_fear_factor, travel_ticks_for_distance};
 
     #[test]
     fn travel_ticks_match_workshop_speed_formula() {
@@ -461,20 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn workshop_fear_output_ring_improves_one_entries_from_front() {
-        assert_eq!(workshop_fear_output_ring(0), [1, 2, 1, 2, 1, 2, 1, 2, 1, 2]);
-        assert_eq!(
-            workshop_fear_output_ring(-2),
-            [2, 2, 2, 2, 1, 2, 1, 2, 1, 2]
-        );
-        assert_eq!(
-            workshop_fear_output_ring(-5),
-            [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
-        );
-    }
-
-    #[test]
-    fn fear_factor_average_output_matches_ten_cycle_ring() {
+    fn fear_factor_average_output_matches_native_productivity() {
         let settings = SimulationSettings::default();
         assert_eq!(
             settings.average_weapon_output_per_cycle(BuildingType::FletchersWorkshop),

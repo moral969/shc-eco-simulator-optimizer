@@ -30,6 +30,7 @@ impl BuildingFactory {
             goods_yard_group_id: None,
             stockpile_resource: None,
             entry_point: None,
+            wheat_layout: 0,
             footprint: Footprint::for_type(building_type),
             components: Vec::new(),
         };
@@ -50,6 +51,7 @@ impl BuildingFactory {
                 goods_yard_group_id: Some(group_id),
                 stockpile_resource: None,
                 entry_point: None,
+                wheat_layout: 0,
                 footprint: Footprint::for_type(BuildingType::Stockpile),
                 components: Vec::new(),
             };

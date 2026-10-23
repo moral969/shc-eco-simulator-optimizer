@@ -19,6 +19,7 @@ pub enum BackendCommand {
     RemoveAt {
         x: i32,
         y: i32,
+        whole_wall: bool,
     },
     RemoveAll,
     RemoveAllWalls,
@@ -46,7 +47,8 @@ pub struct CycleSimulationRow {
     pub armoury_id: Option<u32>,
     pub total_ticks: Option<u64>,
     pub travel_ticks: Option<u64>,
-    pub make_ticks: Option<u64>,
+    pub work_ticks: Option<u64>,
+    pub timing: Option<simulator::CycleTiming>,
     pub average_weapons_per_cycle: f64,
     pub wood_per_cycle: u32,
     pub iron_per_cycle: u32,
@@ -59,6 +61,7 @@ pub struct BackendUpdate {
     pub message: String,
     pub cycle_rows: Option<Vec<CycleSimulationRow>>,
     pub geometry_changed: bool,
+    pub cycle_settings: Option<SimulationSettings>,
 }
 
 #[derive(Clone)]
@@ -104,6 +107,11 @@ fn run_backend(
     let mut paths_stale = true;
 
     for command in receiver {
+        let cycle_settings = match &command {
+            BackendCommand::LoadProject { settings, .. }
+            | BackendCommand::RunCycleSimulation { settings } => Some(*settings),
+            _ => None,
+        };
         let (message, cycle_rows, geometry_changed) = match command {
             BackendCommand::PlaceBuilding {
                 building_type,
@@ -159,10 +167,14 @@ fn run_backend(
                     changed,
                 )
             }
-            BackendCommand::RemoveAt { x, y } => {
+            BackendCommand::RemoveAt { x, y, whole_wall } => {
                 simulator.set_defer_path_calculation(true);
                 let previous = simulator.clone();
-                let outcome = simulator.remove_at(x, y);
+                let outcome = if whole_wall {
+                    simulator.remove_whole_wall_at(x, y)
+                } else {
+                    simulator.remove_at(x, y)
+                };
                 if outcome != RemoveOutcome::None {
                     history.record(previous);
                 }
@@ -171,6 +183,12 @@ fn run_backend(
                     match outcome {
                         RemoveOutcome::None => "Nothing to remove at this cell".to_string(),
                         RemoveOutcome::Wall { id } => format!("Removed Wall #{}", id),
+                        RemoveOutcome::WallCell { affected_wall_ids } => format!(
+                            "Removed wall cell at ({}, {}) from {} segment(s)",
+                            x,
+                            y,
+                            affected_wall_ids.len()
+                        ),
                         RemoveOutcome::Buildings {
                             removed_ids,
                             goods_yard_group_id,
@@ -284,6 +302,7 @@ fn run_backend(
                 simulator.calculate_worker_distances();
                 paths_stale = false;
                 let cycle_rows = build_cycle_simulation_rows(&simulator, settings);
+                simulator.calculate_bread_economy(settings);
                 let success_count = cycle_rows
                     .iter()
                     .filter(|row| row.total_ticks.is_some())
@@ -304,6 +323,7 @@ fn run_backend(
                     paths_stale = false;
                 }
                 let cycle_rows = build_cycle_simulation_rows(&simulator, settings);
+                simulator.calculate_bread_economy(settings);
                 let success_count = cycle_rows
                     .iter()
                     .filter(|row| row.total_ticks.is_some())
@@ -321,6 +341,7 @@ fn run_backend(
         };
 
         if geometry_changed {
+            simulator.refresh_unavailable_entry_points();
             paths_stale = true;
         }
 
@@ -329,6 +350,7 @@ fn run_backend(
             message,
             cycle_rows,
             geometry_changed,
+            cycle_settings,
         });
     }
 }
@@ -382,12 +404,13 @@ fn build_cycle_simulation_rows(
     simulator: &Simulator,
     settings: SimulationSettings,
 ) -> Vec<CycleSimulationRow> {
-    let armoury_ids = simulator
+    let mut armoury_ids = simulator
         .buildings()
         .iter()
         .filter(|building| building.building_type == BuildingType::Armoury)
         .map(|building| building.id)
         .collect::<Vec<_>>();
+    armoury_ids.sort_unstable();
 
     let mut rows = Vec::new();
 
@@ -437,7 +460,8 @@ fn build_cycle_row(
             armoury_id: None,
             total_ticks: None,
             travel_ticks: None,
-            make_ticks: None,
+            work_ticks: None,
+            timing: None,
             average_weapons_per_cycle,
             wood_per_cycle: recipe.wood_required,
             iron_per_cycle: recipe.iron_required,
@@ -452,12 +476,8 @@ fn build_cycle_row(
         match simulator.calculate_production_cycle(weapon_type, workshop_id, *armoury_id, settings)
         {
             Ok(cycle) => {
-                let should_replace = best_cycle
-                    .as_ref()
-                    .is_none_or(|current| cycle.total_ticks < current.total_ticks);
-                if should_replace {
-                    best_cycle = Some(cycle);
-                }
+                best_cycle = Some(cycle);
+                break;
             }
             Err(error) => {
                 if first_error.is_none() {
@@ -475,8 +495,9 @@ fn build_cycle_row(
             armoury_id: Some(cycle.armoury_id),
             total_ticks: Some(cycle.total_ticks),
             travel_ticks: Some(cycle.travel_ticks),
-            make_ticks: Some(cycle.make_ticks),
-            average_weapons_per_cycle,
+            work_ticks: Some(cycle.work_ticks),
+            timing: Some(cycle.timing),
+            average_weapons_per_cycle: cycle.timing.output_per_cycle,
             wood_per_cycle: recipe.wood_required,
             iron_per_cycle: recipe.iron_required,
             error: None,
@@ -490,7 +511,8 @@ fn build_cycle_row(
         armoury_id: None,
         total_ticks: None,
         travel_ticks: None,
-        make_ticks: None,
+        work_ticks: None,
+        timing: None,
         average_weapons_per_cycle,
         wood_per_cycle: recipe.wood_required,
         iron_per_cycle: recipe.iron_required,
@@ -505,6 +527,99 @@ mod tests {
     use simulator::{BuildingType, EntryPoint, MapBounds, SimulationSettings, Simulator};
 
     use super::{BackendCommand, BackendHandle, MapHistory};
+
+    #[test]
+    fn every_map_update_publishes_available_entrance_markers() {
+        let (sender, receiver) = mpsc::channel();
+        let backend = BackendHandle::spawn(40, move |update| {
+            sender.send(update).expect("receiver");
+        })
+        .expect("backend");
+        let commands = [
+            BackendCommand::PlaceBuilding {
+                building_type: BuildingType::GoodsYard,
+                x: 20,
+                y: 20,
+            },
+            // Occupies the two lower stockpiles' original entrances.
+            BackendCommand::PlaceBuilding {
+                building_type: BuildingType::Armoury,
+                x: 20,
+                y: 16,
+            },
+            BackendCommand::PlaceWall {
+                start: (19, 20),
+                end: (19, 20),
+            },
+            BackendCommand::SetStockpileResource {
+                x: 20,
+                y: 20,
+                resource: simulator::StockpileResource::Wood,
+            },
+            BackendCommand::Undo,
+            BackendCommand::Redo,
+            BackendCommand::RemoveAt {
+                x: 19,
+                y: 20,
+                whole_wall: false,
+            },
+            BackendCommand::RemoveAt {
+                x: 20,
+                y: 16,
+                whole_wall: false,
+            },
+            BackendCommand::PlaceBuilding {
+                building_type: BuildingType::PoleturnersWorkshop,
+                x: 10,
+                y: 10,
+            },
+            BackendCommand::PlaceWall {
+                start: (10, 9),
+                end: (13, 9),
+            },
+            BackendCommand::PlaceWall {
+                start: (10, 14),
+                end: (13, 14),
+            },
+        ];
+        for (step, command) in commands.into_iter().enumerate() {
+            backend.send(command).expect("command");
+            let update = receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("update");
+            assert!(update.geometry_changed, "failed edit: {}", update.message);
+            let blocked = update
+                .simulator
+                .buildings()
+                .iter()
+                .flat_map(|building| building.blocking_cells())
+                .chain(
+                    update
+                        .simulator
+                        .walls()
+                        .iter()
+                        .flat_map(|wall| wall.cells()),
+                )
+                .collect::<std::collections::HashSet<_>>();
+            for marker in crate::visuals::build_entry_labels(&update.simulator) {
+                assert!(
+                    !blocked.contains(&(marker.x, marker.y)),
+                    "blocked marker {} after {}",
+                    marker.text,
+                    update.message
+                );
+            }
+            let stacks = update.simulator.buildings();
+            if step == 1 {
+                assert_eq!(stacks[0].entry_point, Some(EntryPoint { x: 19, y: 20 }));
+                assert_eq!(stacks[1].entry_point, Some(EntryPoint { x: 22, y: 20 }));
+            }
+            if (2..=7).contains(&step) {
+                assert_eq!(stacks[0].entry_point, Some(EntryPoint { x: 19, y: 21 }));
+                assert_eq!(stacks[1].entry_point, Some(EntryPoint { x: 22, y: 20 }));
+            }
+        }
+    }
 
     #[test]
     fn loading_project_immediately_returns_fresh_calculation_rows() {
@@ -610,5 +725,28 @@ mod tests {
         assert_eq!(simulator.map_bounds().min_x, -50);
         assert_eq!(simulator.map_bounds().min_y, -50);
         assert_eq!(simulator.buildings().len(), 1);
+    }
+
+    #[test]
+    fn history_restores_a_wall_after_pixel_removal() {
+        let mut simulator = Simulator::new(20).expect("simulator should be created");
+        simulator
+            .place_wall(2, 5, 8, 5)
+            .expect("wall should be placed");
+        let mut history = MapHistory::default();
+
+        let previous = simulator.clone();
+        simulator.remove_at(5, 5);
+        history.record(previous);
+        assert_eq!(simulator.walls().len(), 2);
+        assert!(!simulator.is_cell_occupied(5, 5));
+
+        assert!(history.undo(&mut simulator));
+        assert_eq!(simulator.walls().len(), 1);
+        assert!(simulator.is_cell_occupied(5, 5));
+
+        assert!(history.redo(&mut simulator));
+        assert_eq!(simulator.walls().len(), 2);
+        assert!(!simulator.is_cell_occupied(5, 5));
     }
 }

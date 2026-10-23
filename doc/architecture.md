@@ -42,8 +42,10 @@ shc-eco-simulator/
 - `simulator.rs`: high-level layout operations, automatic canvas expansion, removal, distance rebuilding, and production-cycle entry points.
 - `entry_logic.rs`: entry-point candidates and wall-controlled orientation.
 - `pathfinding.rs` and `distance.rs`: directional shortest-path results between building entries.
-- `production_cycle.rs`: workshop recipes, travel/crafting ticks, resource requirements, and weapon output.
-- `bread.rs`: Wheat Farm, Wind Mill, Bakery, and Granary throughput and bottlenecks.
+- `production_cycle.rs`: workshop recipes, transport/report types, resource requirements and prices.
+- `cycle_timing.rs`: native building/worker clocks, yield remainder, full workshop/bakery cycles and the three-worker mill scheduler.
+- `wheat_cycle.rs`: crop layout/growth/tasks, internal farmer routes and complete wheat-output cycles.
+- `bread.rs`: per-building cycle capacities, bread-chain throughput, storage destinations and bottlenecks. Expensive capacities are cached in `Simulator` and warmed by the backend; speed/purchase accounting remains lightweight.
 - `population_economy.rs`: population, workers, food use, tax, inns, mines, resource deficits/surpluses, and total gold.
 - `game_time.rs` and `worker_distance.rs`: time conversion and worker-route details.
 
@@ -51,7 +53,7 @@ shc-eco-simulator/
 
 `simulator/src/project.rs` defines the serializable `ProjectFile` schema. Project files contain source state only, not derived routes or reports. Loading validates IDs and geometry, rebuilds the `Simulator`, normalizes calculator settings, and accepts both legacy version 1 and current version 2 files.
 
-Version 2 stores explicit `MapBounds`; version 1 stores a square `map_size`. This difference allows current projects to preserve expanded and negative-coordinate canvases.
+Version 2 also optionally stores each wheat layout and the next-layout counter; older files infer alternating layouts. Version 2 stores explicit `MapBounds`; version 1 stores a square `map_size`. This difference allows current projects to preserve expanded and negative-coordinate canvases.
 
 ## `gui` crate
 

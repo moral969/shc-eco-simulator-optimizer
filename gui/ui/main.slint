@@ -537,7 +537,7 @@ export component MainWindow inherits Window {
     in property <string> population-worker-summary: "";
     in property <string> population-economy-summary: "";
 
-    callback place-at(float, float);
+    callback place-at(float, float, bool);
     callback hover-at(float, float);
     callback select-building(string);
     callback clear-selection();
@@ -1117,6 +1117,7 @@ export component MainWindow inherits Window {
                         property <length> start-viewport-y: 0px;
                         property <bool> was-dragging: false;
                         property <bool> pan-active: false;
+                        property <bool> wall-drag-active: false;
 
                         moved => {
                             if self.pan-active {
@@ -1154,6 +1155,26 @@ export component MainWindow inherits Window {
 
                             if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
                                 canvas-key-scope.focus();
+                                if root.selected-building == "wall" {
+                                    self.wall-drag-active = true;
+                                    root.place-at(
+                                        root.map-min-x + (self.mouse-x - map-scroll.viewport-x) / root.cell-px,
+                                        root.map-max-y - (self.mouse-y - map-scroll.viewport-y) / root.cell-px,
+                                        false,
+                                    );
+                                }
+                            }
+
+                            if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                                root.place-at(
+                                    root.map-min-x + (self.mouse-x - map-scroll.viewport-x) / root.cell-px,
+                                    root.map-max-y - (self.mouse-y - map-scroll.viewport-y) / root.cell-px,
+                                    !self.wall-drag-active && event.modifiers.control,
+                                );
+                                self.wall-drag-active = false;
+                            }
+
+                            if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
                                 self.start-mouse-x = self.mouse-x;
                                 self.start-mouse-y = self.mouse-y;
                                 self.start-viewport-x = map-scroll.viewport-x;
@@ -1162,18 +1183,19 @@ export component MainWindow inherits Window {
                                 self.pan-active = true;
                             }
 
-                            if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                            if event.kind == PointerEventKind.up && event.button == PointerEventButton.right {
                                 if !self.was-dragging {
-                                    root.place-at(
-                                        root.map-min-x + (self.mouse-x - map-scroll.viewport-x) / root.cell-px,
-                                        root.map-max-y - (self.mouse-y - map-scroll.viewport-y) / root.cell-px,
-                                    );
+                                    root.clear-selection();
                                 }
                                 self.pan-active = false;
                             }
 
-                            if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
-                                root.clear-selection();
+                            if event.kind == PointerEventKind.cancel {
+                                self.pan-active = false;
+                                if self.wall-drag-active {
+                                    self.wall-drag-active = false;
+                                    root.clear-selection();
+                                }
                             }
                         }
 
@@ -1271,7 +1293,7 @@ export component MainWindow inherits Window {
                             }
 
                             Text {
-                                text: "Workshop cycle preview";
+                                text: "Full workshop cycles";
                                 color: #5f6b7b;
                                 font-size: 12px;
                             }

@@ -148,8 +148,7 @@ impl EditorState {
     }
 
     pub fn set_hover_cell(&mut self, x: f32, y: f32) {
-        let x = x.floor() as i32;
-        let y = y.floor() as i32;
+        let (x, y) = self.wall_endpoint(x.floor() as i32, y.floor() as i32);
 
         if !self.simulator.map_bounds().contains(x, y) {
             self.hover_cell = None;
@@ -159,11 +158,19 @@ impl EditorState {
         self.hover_cell = Some((x, y));
     }
 
-    pub fn place_selected(&mut self, x: f32, y: f32) -> Result<PlacementOutcome, String> {
+    pub fn place_selected(
+        &mut self,
+        x: f32,
+        y: f32,
+        remove_whole_wall: bool,
+    ) -> Result<PlacementOutcome, String> {
         let x = x.floor() as i32;
         let y = y.floor() as i32;
 
         if !self.simulator.map_bounds().contains(x, y) {
+            if matches!(self.selected, Some(SelectedTool::Wall)) {
+                self.wall_start = None;
+            }
             return Err("cell is outside map".to_string());
         }
 
@@ -180,6 +187,7 @@ impl EditorState {
                 Ok(PlacementOutcome::BackendCommand(BackendCommand::RemoveAt {
                     x,
                     y,
+                    whole_wall: remove_whole_wall,
                 }))
             }
             Some(SelectedTool::SetWoodStock) => self.mark_stockpile(x, y, StockpileResource::Wood),
@@ -204,6 +212,7 @@ impl EditorState {
                 )))
             }
             Some((sx, sy)) => {
+                let (x, y) = self.wall_endpoint(x, y);
                 if sx != x && sy != y {
                     return Err(
                         "wall end cell must be horizontal or vertical from start".to_string()
@@ -221,6 +230,18 @@ impl EditorState {
         }
     }
 
+    fn wall_endpoint(&self, x: i32, y: i32) -> (i32, i32) {
+        let Some((start_x, start_y)) = self.wall_start else {
+            return (x, y);
+        };
+
+        if (x - start_x).abs() >= (y - start_y).abs() {
+            (x, start_y)
+        } else {
+            (start_x, y)
+        }
+    }
+
     pub fn simulator(&self) -> &Simulator {
         &self.simulator
     }
@@ -231,7 +252,7 @@ impl EditorState {
 
     pub fn set_simulation_settings(&mut self, settings: SimulationSettings) {
         self.simulation_settings = settings;
-        self.cycle_rows.clear();
+        self.mark_simulation_results_stale();
         self.wall_start = None;
     }
 
@@ -331,6 +352,7 @@ impl EditorState {
         }
 
         self.simulation_settings.fear_factor = snapped;
+        self.mark_simulation_results_stale();
         true
     }
 
@@ -525,7 +547,7 @@ mod tests {
         state.set_hover_cell(-25.2, -10.1);
         assert_eq!(state.hover_cell(), Some((-26, -11)));
         let outcome = state
-            .place_selected(-25.2, -10.1)
+            .place_selected(-25.2, -10.1, false)
             .expect("negative coordinate should be accepted");
 
         match outcome {
@@ -552,5 +574,61 @@ mod tests {
         state.mark_simulation_results_stale();
         assert!(state.simulation_results_stale());
         assert!(state.cycle_rows().is_empty());
+    }
+
+    #[test]
+    fn wall_drag_snaps_to_the_dominant_axis() {
+        let mut state = EditorState::new().expect("editor state should be created");
+        assert!(state.set_selected_from_id("wall"));
+        assert!(matches!(
+            state
+                .place_selected(10.0, 10.0, false)
+                .expect("wall drag should start"),
+            PlacementOutcome::Status(_)
+        ));
+
+        state.set_hover_cell(16.0, 12.0);
+        assert_eq!(state.hover_cell(), Some((16, 10)));
+        assert_eq!(
+            state.preview_cells(),
+            vec![
+                (10, 10),
+                (11, 10),
+                (12, 10),
+                (13, 10),
+                (14, 10),
+                (15, 10),
+                (16, 10)
+            ]
+        );
+
+        let outcome = state
+            .place_selected(16.0, 12.0, false)
+            .expect("wall drag should finish");
+        assert!(matches!(
+            outcome,
+            PlacementOutcome::BackendCommand(BackendCommand::PlaceWall {
+                start: (10, 10),
+                end: (16, 10),
+            })
+        ));
+    }
+
+    #[test]
+    fn remove_tool_forwards_ctrl_as_whole_wall_removal() {
+        let mut state = EditorState::new().expect("editor state should be created");
+        assert!(state.set_selected_from_id("remove"));
+
+        let outcome = state
+            .place_selected(8.0, 9.0, true)
+            .expect("remove command should be created");
+        assert!(matches!(
+            outcome,
+            PlacementOutcome::BackendCommand(BackendCommand::RemoveAt {
+                x: 8,
+                y: 9,
+                whole_wall: true,
+            })
+        ));
     }
 }

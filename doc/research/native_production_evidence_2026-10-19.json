@@ -1,0 +1,344 @@
+{
+  "date": "2026-10-19",
+  "dll_sha256": "fbcb93195fc7efca9bdac5204852efdd76f9818f59a6711750d77c9cef2831e2",
+  "scope": "Static DLL plus synthetic offline native instruction probes; not a full live-world trace.",
+  "boundary_probes": {
+    "dll_sha256": "fbcb93195fc7efca9bdac5204852efdd76f9818f59a6711750d77c9cef2831e2",
+    "method": "Native state-boundary probes, not full live economy simulation.\n\nWorker/building state handlers, yield, crop priority and mill processing execute\noriginal x64 instructions. Arrival, storage selection/capacity, path, rest setup,\ngraphics and goods bookkeeping are explicitly isolated stubs. No game process.\n",
+    "worker_gates": [
+      {
+        "worker": "Fletcher",
+        "gate": "preparation",
+        "calls": 30,
+        "from": 5,
+        "to": 4,
+        "timer": 0
+      },
+      {
+        "worker": "Fletcher",
+        "gate": "output_destination",
+        "calls": 11,
+        "from": 6,
+        "to": 7,
+        "timer": 0
+      },
+      {
+        "worker": "Poleturner",
+        "gate": "preparation",
+        "calls": 30,
+        "from": 6,
+        "to": 5,
+        "timer": 0
+      },
+      {
+        "worker": "Poleturner",
+        "gate": "output_destination",
+        "calls": 11,
+        "from": 7,
+        "to": 8,
+        "timer": 0
+      },
+      {
+        "worker": "Blacksmith",
+        "gate": "preparation",
+        "calls": 30,
+        "from": 6,
+        "to": 5,
+        "timer": 0
+      },
+      {
+        "worker": "Blacksmith",
+        "gate": "output_destination",
+        "calls": 11,
+        "from": 7,
+        "to": 8,
+        "timer": 0
+      },
+      {
+        "worker": "Armourer",
+        "gate": "preparation",
+        "calls": 30,
+        "from": 6,
+        "to": 5,
+        "timer": 0
+      },
+      {
+        "worker": "Armourer",
+        "gate": "output_destination",
+        "calls": 11,
+        "from": 7,
+        "to": 8,
+        "timer": 0
+      },
+      {
+        "worker": "Tanner",
+        "gate": "preparation",
+        "calls": 30,
+        "from": 6,
+        "to": 5,
+        "timer": 0
+      },
+      {
+        "worker": "Tanner",
+        "gate": "output_destination",
+        "calls": 11,
+        "from": 7,
+        "to": 8,
+        "timer": 0
+      },
+      {
+        "worker": "Brewer",
+        "gate": "preparation",
+        "calls": 30,
+        "from": 6,
+        "to": 5,
+        "timer": 0
+      },
+      {
+        "worker": "Brewer",
+        "gate": "output_destination",
+        "calls": 11,
+        "from": 7,
+        "to": 8,
+        "timer": 0
+      },
+      {
+        "worker": "Poleturner",
+        "gate": "transfer_in",
+        "calls": 17,
+        "from": 109,
+        "to": 4,
+        "timer": 0
+      },
+      {
+        "worker": "Poleturner",
+        "gate": "transfer_out",
+        "calls": 17,
+        "from": 109,
+        "to": 4,
+        "timer": 0
+      },
+      {
+        "worker": "Armourer",
+        "gate": "transfer_in",
+        "calls": 17,
+        "from": 109,
+        "to": 4,
+        "timer": 0
+      },
+      {
+        "worker": "Armourer",
+        "gate": "transfer_out",
+        "calls": 17,
+        "from": 109,
+        "to": 4,
+        "timer": 0
+      },
+      {
+        "worker": "Tanner",
+        "gate": "transfer_in",
+        "calls": 17,
+        "from": 109,
+        "to": 4,
+        "timer": 0
+      },
+      {
+        "worker": "Tanner",
+        "gate": "transfer_out",
+        "calls": 17,
+        "from": 109,
+        "to": 4,
+        "timer": 0
+      },
+      {
+        "worker": "Brewer",
+        "gate": "transfer_in",
+        "calls": 17,
+        "from": 109,
+        "to": 4,
+        "timer": 0
+      },
+      {
+        "worker": "Brewer",
+        "gate": "transfer_out",
+        "calls": 17,
+        "from": 109,
+        "to": 4,
+        "timer": 0
+      },
+      {
+        "worker": "Baker",
+        "gate": "transfer_in",
+        "calls": 17,
+        "from": 109,
+        "to": 4,
+        "timer": 0
+      },
+      {
+        "worker": "Baker",
+        "gate": "transfer_out",
+        "calls": 17,
+        "from": 109,
+        "to": 4,
+        "timer": 0
+      }
+    ],
+    "deposits": [
+      {
+        "worker": "Baker",
+        "initial_carry": 8,
+        "initial_timer": -10,
+        "deposit_calls": [
+          15,
+          20,
+          25,
+          30,
+          35,
+          40,
+          45,
+          50
+        ],
+        "scope": "arrival already true every call"
+      },
+      {
+        "worker": "FarmerApple",
+        "initial_carry": 4,
+        "initial_timer": 0,
+        "deposit_calls": [
+          5,
+          10,
+          15,
+          20
+        ],
+        "scope": "arrival already true every call"
+      },
+      {
+        "worker": "FarmerWheat",
+        "initial_carry": 2,
+        "initial_timer": 0,
+        "deposit_calls": [
+          5,
+          10
+        ],
+        "scope": "arrival already true every call"
+      }
+    ],
+    "mill": [
+      {
+        "productivity": 100,
+        "wheat_carry_after_yield": 1,
+        "wheat_removed_from_storage": 1,
+        "processing_calls": 272,
+        "departure_animation_index_gate": 20,
+        "flour_departure_carry": 1,
+        "flour_deposited": 1
+      },
+      {
+        "productivity": 150,
+        "wheat_carry_after_yield": 1,
+        "wheat_removed_from_storage": 1,
+        "processing_calls": 272,
+        "departure_animation_index_gate": 20,
+        "flour_departure_carry": 1,
+        "flour_deposited": 1
+      },
+      {
+        "productivity": 200,
+        "wheat_carry_after_yield": 2,
+        "wheat_removed_from_storage": 1,
+        "processing_calls": 272,
+        "departure_animation_index_gate": 20,
+        "flour_departure_carry": 1,
+        "flour_deposited": 1
+      }
+    ],
+    "wheat_priority": [
+      {
+        "case": "empty",
+        "task_state": 3,
+        "target": 10000
+      },
+      {
+        "case": "prepared",
+        "task_state": 5,
+        "target": 10000
+      },
+      {
+        "case": "growing",
+        "task_state": 2,
+        "target": null
+      },
+      {
+        "case": "eleven_ripe",
+        "task_state": 2,
+        "target": null
+      },
+      {
+        "case": "twelve_ripe",
+        "task_state": 6,
+        "target": 10000
+      },
+      {
+        "case": "ripe_and_cleared",
+        "task_state": 6,
+        "target": 10000
+      },
+      {
+        "case": "four_bundles_and_ripe",
+        "task_state": 8,
+        "target": 10000
+      },
+      {
+        "case": "one_bundle_and_twelve_ripe",
+        "task_state": 6,
+        "target": 10001
+      },
+      {
+        "case": "one_bundle_no_ripe",
+        "task_state": 8,
+        "target": 10000
+      },
+      {
+        "case": "aged",
+        "task_state": 3,
+        "target": 10000
+      }
+    ],
+    "tanner_slaughter": {
+      "sequence_rva": "0x332b88",
+      "positions": 30,
+      "animation_interval": 3,
+      "normalized_ticks": 120,
+      "hides_added": 3,
+      "next_state": 109,
+      "resume_state": 6
+    }
+  },
+  "native_animation_ticks_M_nonzero": {
+    "bow": 581,
+    "crossbow": 509,
+    "spear": 246,
+    "pike": 543,
+    "sword": 1044,
+    "mace": 856,
+    "metal_armour": 512,
+    "leather_armour": 1341,
+    "bread": 1632,
+    "ale_full_pass": 2672
+  },
+  "related_local_evidence": {
+    "worker_speed_probes.json": "C:\\repositories\\shc-dashboard\\artifacts\\production-static\\worker_speed_probes.json",
+    "apple_selection_verified.json": "C:\\repositories\\shc-dashboard\\artifacts\\production-static\\apple_selection_verified.json",
+    "farm_construction_verified.json": "C:\\repositories\\shc-dashboard\\artifacts\\production-static\\farm_construction_verified.json",
+    "fletcher_native_replay.json": "C:\\repositories\\shc-dashboard\\artifacts\\production-static\\fletcher_native_replay.json",
+    "building_access_verified.json": "C:\\repositories\\shc-dashboard\\artifacts\\production-static\\building_access_verified.json",
+    "tile_height_verified.json": "C:\\repositories\\shc-dashboard\\artifacts\\production-static\\tile_height_verified.json"
+  },
+  "probe_script_sha256": {
+    "verify_production_boundaries.py": "b191697ba2a8a4d4c0bc33aa55e10dd09503df73d1d2424323c1a516ece8a418",
+    "probe_worker_speeds.py": "b0674f824006800be046275f3fa601bf7a9a3092dff46c16f8ed12986516b6b0",
+    "verify_apple_selection.py": "4ffd569a78ceb5ea6b4f13457e040bae27255e01a8a5a0690573efb54e672ad4",
+    "verify_farm_construction.py": "dd979afc78cf441ad646c7b3fa4b98e328dc23db0bb7c0727ffa5237c8f231a6",
+    "replay_fletcher_native.py": "b644cebf1e45a3bb1668f964853e3c96917b035ae64e9284be3b95281e5614c6"
+  }
+}

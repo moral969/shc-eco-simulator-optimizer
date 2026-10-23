@@ -61,28 +61,38 @@ cells per tick = 1 / (8 × (SB + 1))
 ```
 
 - Weapon workshops and Bakeries use `SB = 2`, or 24 ticks/cell.
-- Wheat Farms and Wind Mills use `SB = 1`, normally 16 ticks/cell.
-- A returning empty Wheat Farm worker uses 12 ticks/cell (`SB = 1`, `SP = 1`).
+- Wheat farmers currently use the inspected `SB = 1`, `SP = 0` profile: 16 ticks/cell in both directions.
+- Millers use 12 ticks/cell empty and 16 loaded. The old empirical empty-farmer=12 assumption is archived; its native switch remains unresolved.
 
 See [unit_movement_speed.md](unit_movement_speed.md) for the detailed movement reference.
 
 ## Weapon production
 
-| Weapon | Workshop | Wood | Iron | Work ticks | Sell gold |
+Production uses the single [full-cycle model](full_cycle_model.md). Each operation
+includes individual input trips, handling/transfer gates, native animation phases,
+output selection, deposits and the next input/return path. Empirical whole-work
+constants and the synthetic fear-output ring have been removed from runtime.
+The previous values/formulas are saved in [the calibration archive](backups/empirical_cycles_before_replacement_2026-10-20.md).
+
+| Weapon | Workshop | Wood | Iron | Normalized animation ticks | Sell gold |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Bow | Fletcher | 2 | 0 | 638 | 15 |
-| Crossbow | Fletcher | 3 | 0 | 565 | 30 |
-| Spear | Poleturner | 1 | 0 | 332 | 10 |
-| Pike | Poleturner | 2 | 0 | 872 | 18 |
-| Sword | Blacksmith | 0 | 1 | 1090 | 30 |
-| Mace | Blacksmith | 0 | 1 | 910 | 30 |
-| Armor | Armourer | 0 | 1 | 625 | 30 |
+| Bow | Fletcher | 2 | 0 | 581 | 15 |
+| Crossbow | Fletcher | 3 | 0 | 509 | 30 |
+| Spear | Poleturner | 1 | 0 | 246 | 10 |
+| Pike | Poleturner | 2 | 0 | 543 | 18 |
+| Sword | Blacksmith | 0 | 1 | 1044 | 30 |
+| Mace | Blacksmith | 0 | 1 | 856 | 30 |
+| Armor | Armourer | 0 | 1 | 512 | 30 |
 
-A worker carries one resource unit per trip. Normal cycles route from Armoury to the required Stockpile, then Workshop; multi-unit recipes repeat the Stockpile-to-Workshop delivery. Crafting time is added before the Workshop-to-Armoury return.
+The animation column excludes transport and handling. The reported full cycle is
+measured over repeated complete batches; tooltips include mean and variation.
+Pikes include their rotating between-input idle sequences; armourers include a
+second 30-call local-buffer check. Output uses native per-worker fractional carry.
 
-By default, a Fletcher's next cycle starts through the workshop before collecting wood. **Optimize Fletcher routing** changes it to the normal direct Armoury-to-Wood Stockpile route.
-
-Workshop fear output uses a ten-cycle ring. At Fear Factor 0 the ring alternates one and two goods. Each step toward -5 changes one remaining single-output cycle to two.
+A Fletcher normally returns via its workshop before collecting the next wood.
+**Optimize Fletcher routing** sends it directly from armoury to the input stack.
+Other workshops take that successful direct input route. New armoury selection
+uses ascending eligible IDs rather than the shortest complete loop.
 
 ### Iron supply
 
@@ -90,15 +100,29 @@ Iron mines produce only when the layout contains a Stockpile marked as Iron. Pro
 
 ## Bread production
 
-- A Wheat Farm cycle has 6,950 work ticks plus 12 loaded Farm-to-Wheat-Stock and empty return walks.
-- A farm produces 24 wheat/cycle at Fear Factor 0 and 36 at -5, interpolated linearly.
-- A Wind Mill has three workers, but wheat-to-flour processing is serialized at 312 ticks per unit plus travel.
-- The Mill route is Flour Stockpile → Wheat Stockpile → Mill → Flour Stockpile.
-- A Bakery route is Granary → Flour Stockpile → Bakery → Granary plus 1,700 work ticks.
-- One flour produces 8 bread at Fear Factor 0 and 12 at -5, interpolated linearly.
-- Actual bread throughput is limited by wheat supply, Mill capacity, or Bakery capacity.
+Wheat farms simulate 36 crop cells, both persistent layouts, the 151-update growth
+pulse, cached farm task, farmer animations, internal paths, bundles and deposits.
+Growth overlaps work and transport. There is no constant 6950-work-tick field
+cycle or assumption of twelve identical cabin/stock round trips.
 
-When **Buy Wheat** is enabled, bought wheat fills available Mill/Bakery demand after farm production. When **Buy Flour** is enabled, bought flour fills remaining Bakery demand after produced flour. Input purchase costs are deducted from bread sale gold. Reports show produced and surplus wheat/flour, purchased inputs, bread production/sale gold, total gold, and the active bottleneck.
+Mills schedule three workers against one processor. Grinding takes 272 aligned
+updates and the native wheel/reset gate also controls the next claim: the
+zero-walk three-worker fixture outputs one flour every 302 ticks. Walking and
+queueing determine the capacity on the actual layout.
+
+Bakeries simulate collection, transfer, native 1632-normalized-tick processing,
+output selection and individual bread deposits. The negative departure timer
+advances while walking; handling is not blindly added on top of travel. Granary
+selection uses ascending IDs rather than the shortest loop.
+
+Actual bread throughput is limited by wheat supply, mill capacity or bakery
+capacity. Buy Wheat / Buy Flour fill the permitted deficit; input costs are
+deducted from bread income. Reports retain existing surplus, purchase, bottleneck
+and per-building output fields and add cycle timing statistics.
+
+Capacity runs assume available inputs/storage, assigned workers and flat routes
+without terrain or crowd delays. This is not a finite-inventory/hiring simulation.
+Apple farms remain unsupported. See [the implementation and validation details](full_cycle_model.md).
 
 ## Population and additional economy
 

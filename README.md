@@ -4,6 +4,10 @@ SHC Eco Simulator is a Windows desktop layout planner for Stronghold Crusader ec
 
 The simulator currently covers weapon workshops, the wheat-to-bread chain, stockpile routing, building costs, iron and stone production, and an optional population/tax/food/inn economy calculation.
 
+Production uses one Rust [full-cycle model](doc/full_cycle_model.md) for the existing weapon workshops, wheat farms, mills and bakeries. Calculations include worker handling, native animation clocks, actual flat-map routes and deposits. The [previous empirical values and formulas](doc/backups/empirical_cycles_before_replacement_2026-10-20.md) are archived as Markdown; the app has no legacy-model switch.
+
+[DLL production research](doc/native_production_cycles.md) and the [historical wheat comparison](doc/wheat_cycle_comparison.md) contain the evidence and known movement assumptions.
+
 ## Download and run
 
 The easiest way to use the app is to open the [GitHub Releases page](https://github.com/rustamNSU/shc-eco-simulator/releases/latest), download `SHCEcoSim.exe` from the latest release assets, and run it. No Rust installation is needed for the release executable.
@@ -32,13 +36,19 @@ The main window has three columns:
 
 ### Editing
 
-- **Remove** selects a single-cell removal tool.
+- Hold the right mouse button and drag to move around the map. A right-click without dragging clears the selected tool.
+- Select **Wall**, hold the left mouse button at the first cell, drag, and release at the endpoint. The preview snaps to the dominant horizontal or vertical direction.
+- Walls may cross other walls, but they cannot pass through buildings.
+- **Remove** followed by a left-click removes one wall cell or the complete building at that cell.
+- Hold `Ctrl` while clicking a wall with **Remove** to delete that complete wall segment.
 - **Remove All Walls** clears walls without removing buildings.
 - **Remove All** clears the complete map.
 - **Edit > Undo** or `Ctrl+Z` restores the previous map snapshot.
 - **Edit > Redo** or `Ctrl+Y` reapplies an undone map snapshot.
 
 Undo/redo covers building placement and removal, wall changes, stockpile resource assignments, entry-point changes caused by geometry, canvas expansion, and bulk removal. For example, **Remove All** can be undone in one step. A new map edit after undo clears the redo chain, and opening a project starts a new history.
+
+After a layout edit, entrances with a walkable local exit stay in place. Blocked or locally enclosed entrances are searched again in the usual side-cell order, followed by diagonal corners. This checks routes within six cells of each candidate instead of recalculating the complete economy. Opening a wall cell or removing a building also restores entrances that had no available candidate.
 
 Simulation settings are lightweight and update their calculations directly; they are not part of map undo/redo history.
 
@@ -97,7 +107,7 @@ Build an optimized Windows executable:
 cargo build --release -p gui
 ```
 
-The locally built executable is `target\release\gui.exe`.
+The locally built executable is `target\release\SHCEcoSim.exe`. Windows builds use Slint's software renderer so the app does not depend on OpenGL driver compatibility or Windows compatibility mode.
 
 Run the validation suite with:
 
@@ -109,6 +119,7 @@ cargo test --workspace
 
 ## Developer documentation
 
+- [Full production-cycle model](doc/full_cycle_model.md) - active timing rules, limitations and native regression anchors.
 - [Architecture](doc/architecture.md) — crate responsibilities, UI/backend data flow, history, persistence, and extension points.
 - [Simulation model](doc/simulation_model.md) — placement, routing, production formulas, costs, and population economy rules.
 - [Unit movement speed](doc/unit_movement_speed.md) — detailed tick and movement reference.

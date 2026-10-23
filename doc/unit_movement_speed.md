@@ -2,6 +2,8 @@
 
 ## Formula
 
+Static DLL analysis on 2026-10-14 confirmed the formula below for normal movement with fixed actual slowdown and no extra queue/special-state delay. It is an average over movement batches: the DLL waits `SB + SpeedUp + 1` updates, then advances `SpeedUp + 1` substeps; eight substeps span a tile. Integer batch timing, slopes, terrain buildup/decay, congestion, and route boundaries can change individual step timings. See the [native movement findings](/C:/repositories/shc-dashboard/SHCDE_UNIT_MOVEMENT.md) for the counter logic, offset-base mapping, and simulator discrepancies; the older coefficient tables below are preserved for comparison.
+
 For one unit to move by **1 cell**:
 
 \[
@@ -69,7 +71,7 @@ Offsets:
 | `UNIT_BEDOUIN_HEAVY_CAMEL` | 83 |             1 |       2 |
 
 Note:
-- `UNIT_FARMER_WHEAT` uses `SpeedUp=0` while carrying wheat to stock and `SpeedUp=1` while returning empty-handed.
+- Historical observation: wheat farmers were modelled as `SpeedUp=0` loaded and `SpeedUp=1` empty. The inspected callbacks retain the incoming value; the active full-cycle planner uses U=0/16 ticks per tile throughout until the automatic switch is resolved.
 - `UNIT_MACEMAN` uses `SB=1`, `SpeedUp=1` in normal gameplay.
 - In map editor it can appear as `SpeedUp=0` (known bug/inconsistency).
 

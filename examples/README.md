@@ -4,6 +4,7 @@ These files are complete SHC Eco Simulator layouts. Download any `.json` file an
 
 | File | Format | Purpose |
 | --- | ---: | --- |
+| [`2k8pt_5100_optimal_workshops.json`](2k8pt_5100_optimal_workshops.json) | 2 | Six-minute layout: 15 Crossbow Fletchers + 17 Spear Poleturners, 1801.49 gold/min, no permanent walls ([build guide](2k8pt_5100_optimal_workshops.md)) |
 | `2k8pt_3green_CN_Manuel.json` | 2 | Mixed three-farm bread and weapon economy with walls and population settings |
 | `2k8pt_3green_eco_squad_rustam.json` | 2 | Alternative mixed three-farm layout |
 | `2k8pt_3green_optimized.json` | 2 | Optimized mixed layout without temporary walls |

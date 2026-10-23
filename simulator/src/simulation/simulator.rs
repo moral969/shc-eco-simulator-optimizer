@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
@@ -11,7 +12,10 @@ use crate::{
 use super::{
     BreadEconomyReport, BuildingDistance, DistanceKey, GameTime,
     bread::calculate_bread_economy,
-    entry_logic::{calculate_building_entry, resolve_entry_point_for_square, wall_contains_cell},
+    entry_logic::{
+        calculate_building_entry, entry_is_accessible, resolve_entry_point_for_square,
+        wall_contains_cell,
+    },
     pathfinding::recompute_building_distances,
     production_cycle::{
         ProductionCycle, ProductionCycleError, ProductionRouteUsage, SimulationSettings,
@@ -32,6 +36,8 @@ pub struct Simulator {
     distances: HashMap<DistanceKey, BuildingDistance>,
     worker_distances: HashMap<DistanceKey, BuildingDistance>,
     defer_path_calculation: bool,
+    next_wheat_layout: u8,
+    bread_capacities: RefCell<Option<(i32, super::bread::BreadCapacities)>>,
 }
 
 #[derive(Debug)]
@@ -53,6 +59,9 @@ pub enum RemoveOutcome {
     },
     Wall {
         id: u32,
+    },
+    WallCell {
+        affected_wall_ids: Vec<u32>,
     },
 }
 
@@ -92,7 +101,33 @@ fn is_entry_point_available(
         return false;
     };
 
-    map.is_in_bounds(entry_point.x, entry_point.y) && !map.is_blocked(entry_point.x, entry_point.y)
+    entry_is_accessible(map, entry_point)
+}
+
+fn wall_pieces_without_cell(wall: WallSegment, x: i32, y: i32) -> Vec<WallSegment> {
+    let mut pieces = Vec::with_capacity(2);
+
+    if wall.start_x == wall.end_x {
+        let min_y = wall.start_y.min(wall.end_y);
+        let max_y = wall.start_y.max(wall.end_y);
+        if y > min_y {
+            pieces.push(WallSegment::new(wall.id, x, min_y, x, y - 1));
+        }
+        if y < max_y {
+            pieces.push(WallSegment::new(wall.id, x, y + 1, x, max_y));
+        }
+        return pieces;
+    }
+
+    let min_x = wall.start_x.min(wall.end_x);
+    let max_x = wall.start_x.max(wall.end_x);
+    if x > min_x {
+        pieces.push(WallSegment::new(wall.id, min_x, y, x - 1, y));
+    }
+    if x < max_x {
+        pieces.push(WallSegment::new(wall.id, x + 1, y, max_x, y));
+    }
+    pieces
 }
 
 impl Simulator {
@@ -114,18 +149,33 @@ impl Simulator {
             distances: HashMap::new(),
             worker_distances: HashMap::new(),
             defer_path_calculation: false,
+            next_wheat_layout: 0,
+            bread_capacities: RefCell::new(None),
         })
     }
 
     pub fn from_saved_layout(
         bounds: MapBounds,
-        saved_buildings: Vec<SavedBuilding>,
+        mut saved_buildings: Vec<SavedBuilding>,
         walls: Vec<WallSegment>,
     ) -> Result<Self, SimulatorError> {
         if !bounds.is_valid() {
             return Err(SimulatorError::InvalidMapSize);
         }
         validate_unique_ids(&saved_buildings, &walls)?;
+        let mut next_wheat_layout = 0;
+        for building in &mut saved_buildings {
+            if building.building_type == BuildingType::WheatFarm {
+                let layout = building.wheat_layout.unwrap_or(next_wheat_layout);
+                if layout > 1 {
+                    return Err(SimulatorError::InvalidProject(
+                        "wheat layout must be 0 or 1",
+                    ));
+                }
+                building.wheat_layout = Some(layout);
+                next_wheat_layout = 1 - layout;
+            }
+        }
 
         let next_building_id = saved_buildings
             .iter()
@@ -170,7 +220,7 @@ impl Simulator {
             if !wall.is_axis_aligned() {
                 return Err(SimulatorError::InvalidWallDirection);
             }
-            map.place_cells(wall.id, wall.cells())?;
+            map.place_wall_cells(wall.cells())?;
         }
 
         let mut simulator = Self {
@@ -180,16 +230,33 @@ impl Simulator {
             buildings,
             walls,
             next_wall_id,
+            next_wheat_layout,
+            bread_capacities: RefCell::new(None),
             distances: HashMap::new(),
             worker_distances: HashMap::new(),
             defer_path_calculation: false,
         };
+        simulator.refresh_unavailable_entry_points();
         simulator.recompute_distances();
         Ok(simulator)
     }
 
     pub fn map_size(&self) -> usize {
         self.map.width()
+    }
+
+    pub(crate) fn next_wheat_layout(&self) -> u8 {
+        self.next_wheat_layout
+    }
+
+    pub(crate) fn restore_next_wheat_layout(&mut self, layout: u8) -> Result<(), SimulatorError> {
+        if layout > 1 {
+            return Err(SimulatorError::InvalidProject(
+                "next wheat layout must be 0 or 1",
+            ));
+        }
+        self.next_wheat_layout = layout;
+        Ok(())
     }
 
     pub fn map_bounds(&self) -> MapBounds {
@@ -290,6 +357,10 @@ impl Simulator {
         }
 
         let mut placement = self.factory.create(building_type, x, y);
+        if building_type == BuildingType::WheatFarm {
+            placement.wheat_layout = self.next_wheat_layout;
+            self.next_wheat_layout ^= 1;
+        }
         self.map.place(&placement)?;
         self.assign_entry_points(&mut placement);
         let id = placement.id;
@@ -331,7 +402,7 @@ impl Simulator {
         }
 
         let cells = line_cells(start_x, start_y, end_x, end_y);
-        self.map.place_cells(wall.id, cells.iter().copied())?;
+        self.map.place_wall_cells(cells.iter().copied())?;
         self.walls.push(wall);
         self.next_wall_id += 1;
         self.refresh_unavailable_entry_points();
@@ -360,6 +431,19 @@ impl Simulator {
     }
 
     pub fn remove_at(&mut self, x: i32, y: i32) -> RemoveOutcome {
+        self.remove_at_with_wall_behavior(x, y, false)
+    }
+
+    pub fn remove_whole_wall_at(&mut self, x: i32, y: i32) -> RemoveOutcome {
+        self.remove_at_with_wall_behavior(x, y, true)
+    }
+
+    fn remove_at_with_wall_behavior(
+        &mut self,
+        x: i32,
+        y: i32,
+        remove_whole_wall: bool,
+    ) -> RemoveOutcome {
         if let Some((target_id, goods_yard_group_id)) = self
             .buildings
             .iter()
@@ -378,13 +462,19 @@ impl Simulator {
             };
         }
 
-        if let Some(index) = self
-            .walls
-            .iter()
-            .position(|wall| wall_contains_cell(wall, x, y))
+        if remove_whole_wall
+            && let Some(index) = self
+                .walls
+                .iter()
+                .rposition(|wall| wall_contains_cell(wall, x, y))
         {
             let id = self.remove_wall_by_index(index);
             return RemoveOutcome::Wall { id };
+        }
+
+        let affected_wall_ids = self.remove_wall_cell(x, y);
+        if !affected_wall_ids.is_empty() {
+            return RemoveOutcome::WallCell { affected_wall_ids };
         }
 
         RemoveOutcome::None
@@ -397,7 +487,7 @@ impl Simulator {
         }
 
         for wall in self.walls.drain(..) {
-            self.map.clear_cells(wall.cells());
+            self.map.clear_wall_cells(wall.cells());
         }
 
         self.refresh_unavailable_entry_points();
@@ -413,11 +503,13 @@ impl Simulator {
             self.map.clear_cells(building.occupied_cells());
         }
         for wall in self.walls.drain(..) {
-            self.map.clear_cells(wall.cells());
+            self.map.clear_wall_cells(wall.cells());
         }
 
         self.distances.clear();
         self.worker_distances.clear();
+
+        self.bread_capacities.get_mut().take();
 
         (building_count, wall_count)
     }
@@ -441,7 +533,23 @@ impl Simulator {
     }
 
     pub fn calculate_bread_economy(&self, settings: SimulationSettings) -> BreadEconomyReport {
-        calculate_bread_economy(&self.buildings, &self.distances, settings)
+        let fear = super::clamped_fear_factor(settings.fear_factor);
+        let mut cache = self.bread_capacities.borrow_mut();
+        if cache.as_ref().is_some_and(|entry| entry.0 != fear) {
+            *cache = None;
+        }
+        let (_, capacities) = cache.get_or_insert_with(|| {
+            (
+                fear,
+                super::bread::calculate_capacities(
+                    &self.map,
+                    &self.buildings,
+                    &self.distances,
+                    fear,
+                ),
+            )
+        });
+        calculate_bread_economy(capacities, settings)
     }
 
     pub fn calculate_production_cycle(
@@ -472,24 +580,54 @@ impl Simulator {
             });
         }
 
+        let resource = if recipe.wood_required > 0 {
+            StockpileResource::Wood
+        } else {
+            StockpileResource::Iron
+        };
+        let input = find_stockpile_for_resource(&self.buildings, resource)
+            .ok_or(ProductionCycleError::MissingStockpile { resource })?;
         let mut route_usage = Vec::new();
-        self.append_resource_phase_routes(
+        let required = recipe.total_required_units();
+        let ordinary_fletcher = recipe.workshop_type == BuildingType::FletchersWorkshop
+            && !settings.optimized_fletcher_routing;
+        if ordinary_fletcher {
+            self.push_route_usage(
+                &mut route_usage,
+                recipe.workshop_type,
+                armoury_id,
+                workshop_id,
+                1,
+            )?;
+            self.push_route_usage(
+                &mut route_usage,
+                recipe.workshop_type,
+                workshop_id,
+                input.id,
+                required,
+            )?;
+        } else {
+            self.push_route_usage(
+                &mut route_usage,
+                recipe.workshop_type,
+                armoury_id,
+                input.id,
+                1,
+            )?;
+            self.push_route_usage(
+                &mut route_usage,
+                recipe.workshop_type,
+                workshop_id,
+                input.id,
+                required - 1,
+            )?;
+        }
+        self.push_route_usage(
             &mut route_usage,
-            workshop_id,
-            armoury_id,
-            settings,
-            StockpileResource::Wood,
-            recipe.wood_required,
             recipe.workshop_type,
-        )?;
-        self.append_resource_phase_routes(
-            &mut route_usage,
+            input.id,
             workshop_id,
-            armoury_id,
-            settings,
-            StockpileResource::Iron,
-            recipe.iron_required,
-            recipe.workshop_type,
+            required,
         )?;
         self.push_route_usage(
             &mut route_usage,
@@ -498,12 +636,24 @@ impl Simulator {
             armoury_id,
             1,
         )?;
-
+        let ticks = |from, to| {
+            distance_cells(&self.worker_distances, from, to)
+                .map(|distance| travel_ticks_for_distance(recipe.workshop_type, distance))
+        };
+        let paths = super::cycle_timing::WorkshopPaths {
+            home_to_input: ticks(workshop_id, input.id)?,
+            input_to_home: ticks(input.id, workshop_id)?,
+            home_to_output: ticks(workshop_id, armoury_id)?,
+            output_to_input: ticks(armoury_id, input.id)?,
+            output_to_home: ticks(armoury_id, workshop_id)?,
+        };
+        let timing = super::cycle_timing::workshop_cycle(weapon_type, paths, settings);
         Ok(ProductionCycle::from_route_usage(
             recipe,
             workshop_id,
             armoury_id,
             route_usage,
+            timing,
         ))
     }
 
@@ -608,13 +758,14 @@ impl Simulator {
             expanded_map.place(building)?;
         }
         for wall in &self.walls {
-            expanded_map.place_cells(wall.id, wall.cells())?;
+            expanded_map.place_wall_cells(wall.cells())?;
         }
         self.map = expanded_map;
         Ok(())
     }
 
-    fn refresh_unavailable_entry_points(&mut self) {
+    /// Checks every building and stack, preserving entrances with a walkable local exit.
+    pub fn refresh_unavailable_entry_points(&mut self) {
         for index in 0..self.buildings.len() {
             let (building_entry, component_entries) = {
                 let building = &self.buildings[index];
@@ -652,11 +803,7 @@ impl Simulator {
 
             let building = &mut self.buildings[index];
             building.entry_point = building_entry;
-            for (component, new_entry) in building
-                .components
-                .iter_mut()
-                .zip(component_entries.into_iter())
-            {
+            for (component, new_entry) in building.components.iter_mut().zip(component_entries) {
                 component.entry_point = new_entry;
             }
         }
@@ -705,13 +852,49 @@ impl Simulator {
 
     fn remove_wall_by_index(&mut self, index: usize) -> u32 {
         let wall = self.walls.remove(index);
-        self.map.clear_cells(wall.cells());
+        self.map.clear_wall_cells(wall.cells());
         self.refresh_unavailable_entry_points();
         self.recompute_distances();
         wall.id
     }
 
+    fn remove_wall_cell(&mut self, x: i32, y: i32) -> Vec<u32> {
+        let mut affected_wall_ids = Vec::new();
+        let mut updated_walls = Vec::with_capacity(self.walls.len() + 1);
+
+        for wall in std::mem::take(&mut self.walls) {
+            if !wall_contains_cell(&wall, x, y) {
+                updated_walls.push(wall);
+                continue;
+            }
+
+            affected_wall_ids.push(wall.id);
+            self.map.clear_wall_cells([(x, y)]);
+
+            let mut pieces = wall_pieces_without_cell(wall, x, y);
+            if let Some(first) = pieces.first_mut() {
+                first.id = wall.id;
+            }
+            if pieces.len() == 2 {
+                pieces[1].id = self.next_wall_id;
+                self.next_wall_id += 1;
+            }
+            updated_walls.extend(pieces);
+        }
+
+        if affected_wall_ids.is_empty() {
+            self.walls = updated_walls;
+            return affected_wall_ids;
+        }
+
+        self.walls = updated_walls;
+        self.refresh_unavailable_entry_points();
+        self.recompute_distances();
+        affected_wall_ids
+    }
+
     fn recompute_distances(&mut self) {
+        self.bread_capacities.get_mut().take();
         if self.defer_path_calculation {
             self.distances.clear();
             self.worker_distances.clear();
@@ -722,60 +905,8 @@ impl Simulator {
     }
 
     fn recompute_worker_distances(&mut self) {
+        self.bread_capacities.get_mut().take();
         self.worker_distances = build_worker_distances(&self.buildings, &self.distances);
-    }
-
-    fn append_resource_phase_routes(
-        &self,
-        route_usage: &mut Vec<ProductionRouteUsage>,
-        workshop_id: u32,
-        armoury_id: u32,
-        settings: SimulationSettings,
-        resource: StockpileResource,
-        required_units: u32,
-        workshop_type: BuildingType,
-    ) -> Result<(), ProductionCycleError> {
-        if required_units == 0 {
-            return Ok(());
-        }
-
-        let stockpile = find_stockpile_for_resource(&self.buildings, resource)
-            .ok_or(ProductionCycleError::MissingStockpile { resource })?;
-        let stockpile_id = stockpile.id;
-        let starts_from_workshop = workshop_type == BuildingType::FletchersWorkshop
-            && !settings.optimized_fletcher_routing;
-
-        if starts_from_workshop {
-            self.push_route_usage(route_usage, workshop_type, armoury_id, workshop_id, 1)?;
-            self.push_route_usage(
-                route_usage,
-                workshop_type,
-                workshop_id,
-                stockpile_id,
-                required_units,
-            )?;
-        } else {
-            self.push_route_usage(route_usage, workshop_type, armoury_id, stockpile_id, 1)?;
-            if required_units > 1 {
-                self.push_route_usage(
-                    route_usage,
-                    workshop_type,
-                    workshop_id,
-                    stockpile_id,
-                    required_units - 1,
-                )?;
-            }
-        }
-
-        self.push_route_usage(
-            route_usage,
-            workshop_type,
-            stockpile_id,
-            workshop_id,
-            required_units,
-        )?;
-
-        Ok(())
     }
 
     fn push_route_usage(
@@ -825,13 +956,42 @@ impl Simulator {
 #[cfg(test)]
 mod tests {
     use crate::{
-        MapBounds,
+        MapBounds, MapError, WallSegment,
         buildings::{BuildingType, EntryPoint, StockpileResource},
     };
 
     use super::{
         DistanceKey, RemoveOutcome, SimulationSettings, Simulator, SimulatorError, WeaponType,
     };
+
+    #[test]
+    fn bread_capacity_cache_tracks_resource_changes_recalculation_and_clear() {
+        let mut simulator = Simulator::new(60).expect("map");
+        simulator
+            .place_building(BuildingType::WheatFarm, 2, 2)
+            .expect("farm");
+        simulator
+            .place_building(BuildingType::GoodsYard, 20, 20)
+            .expect("stock");
+        let settings = SimulationSettings::default();
+        assert_eq!(
+            simulator.calculate_bread_economy(settings).wheat_per_minute,
+            0.0
+        );
+        simulator
+            .set_stockpile_resource_at(20, 20, StockpileResource::Wheat)
+            .expect("mark wheat");
+        let first = simulator.calculate_bread_economy(settings);
+        assert!(first.wheat_per_minute > 0.0);
+        simulator.set_defer_path_calculation(true);
+        simulator.calculate_worker_distances();
+        assert_eq!(simulator.calculate_bread_economy(settings), first);
+        simulator.remove_all();
+        assert_eq!(
+            simulator.calculate_bread_economy(settings).wheat_per_minute,
+            0.0
+        );
+    }
 
     #[test]
     fn places_workshop_when_space_is_free() {
@@ -1122,6 +1282,149 @@ mod tests {
     }
 
     #[test]
+    fn walls_can_cross_and_keep_the_intersection_until_both_are_removed() {
+        let mut simulator = Simulator::new(20).expect("simulator should be created");
+        let horizontal_id = simulator
+            .place_wall(2, 5, 8, 5)
+            .expect("horizontal wall should be placed");
+        let vertical_id = simulator
+            .place_wall(5, 2, 5, 8)
+            .expect("vertical wall should cross the horizontal wall");
+
+        assert!(simulator.is_cell_occupied(5, 5));
+        assert_eq!(
+            simulator.remove_whole_wall_at(5, 5),
+            RemoveOutcome::Wall { id: vertical_id }
+        );
+        assert!(simulator.is_cell_occupied(5, 5));
+        assert_eq!(
+            simulator.remove_whole_wall_at(5, 5),
+            RemoveOutcome::Wall { id: horizontal_id }
+        );
+        assert!(!simulator.is_cell_occupied(5, 5));
+    }
+
+    #[test]
+    fn overlapping_wall_cells_remain_until_every_covering_segment_is_removed() {
+        let mut simulator = Simulator::new(20).expect("simulator should be created");
+        let first_id = simulator
+            .place_wall(2, 5, 7, 5)
+            .expect("first wall should be placed");
+        let second_id = simulator
+            .place_wall(5, 5, 10, 5)
+            .expect("overlapping wall should be placed");
+
+        assert_eq!(
+            simulator.remove_whole_wall_at(6, 5),
+            RemoveOutcome::Wall { id: second_id }
+        );
+        assert!(simulator.is_cell_occupied(6, 5));
+        assert_eq!(
+            simulator.remove_whole_wall_at(6, 5),
+            RemoveOutcome::Wall { id: first_id }
+        );
+        assert!(!simulator.is_cell_occupied(6, 5));
+    }
+
+    #[test]
+    fn removing_a_middle_wall_cell_splits_the_segment() {
+        let mut simulator = Simulator::new(20).expect("simulator should be created");
+        simulator
+            .place_wall(2, 4, 6, 4)
+            .expect("wall should be placed");
+
+        let outcome = simulator.remove_at(4, 4);
+        assert_eq!(
+            outcome,
+            RemoveOutcome::WallCell {
+                affected_wall_ids: vec![1]
+            }
+        );
+        assert_eq!(simulator.walls().len(), 2);
+        assert_eq!(simulator.walls()[0], WallSegment::new(1, 2, 4, 3, 4));
+        assert_eq!(simulator.walls()[1], WallSegment::new(2, 5, 4, 6, 4));
+        assert!(simulator.is_cell_occupied(3, 4));
+        assert!(!simulator.is_cell_occupied(4, 4));
+        assert!(simulator.is_cell_occupied(5, 4));
+    }
+
+    #[test]
+    fn removing_a_wall_endpoint_shortens_the_segment() {
+        let mut simulator = Simulator::new(20).expect("simulator should be created");
+        simulator
+            .place_wall(2, 4, 6, 4)
+            .expect("wall should be placed");
+
+        assert!(matches!(
+            simulator.remove_at(2, 4),
+            RemoveOutcome::WallCell { .. }
+        ));
+        assert_eq!(simulator.walls(), &[WallSegment::new(1, 3, 4, 6, 4)]);
+        assert!(!simulator.is_cell_occupied(2, 4));
+        assert!(simulator.is_cell_occupied(3, 4));
+    }
+
+    #[test]
+    fn removing_a_single_wall_cell_deletes_its_segment() {
+        let mut simulator = Simulator::new(20).expect("simulator should be created");
+        simulator
+            .place_wall(4, 4, 4, 4)
+            .expect("one-cell wall should be placed");
+
+        assert!(matches!(
+            simulator.remove_at(4, 4),
+            RemoveOutcome::WallCell { .. }
+        ));
+        assert!(simulator.walls().is_empty());
+        assert!(!simulator.is_cell_occupied(4, 4));
+    }
+
+    #[test]
+    fn removing_an_intersection_cell_splits_every_wall_through_it() {
+        let mut simulator = Simulator::new(20).expect("simulator should be created");
+        simulator
+            .place_wall(2, 5, 8, 5)
+            .expect("horizontal wall should be placed");
+        simulator
+            .place_wall(5, 2, 5, 8)
+            .expect("vertical wall should be placed");
+
+        let outcome = simulator.remove_at(5, 5);
+        assert_eq!(
+            outcome,
+            RemoveOutcome::WallCell {
+                affected_wall_ids: vec![1, 2]
+            }
+        );
+        assert_eq!(simulator.walls().len(), 4);
+        assert!(!simulator.is_cell_occupied(5, 5));
+        assert!(simulator.is_cell_occupied(4, 5));
+        assert!(simulator.is_cell_occupied(6, 5));
+        assert!(simulator.is_cell_occupied(5, 4));
+        assert!(simulator.is_cell_occupied(5, 6));
+    }
+
+    #[test]
+    fn walls_can_cross_walls_but_not_buildings() {
+        let mut simulator = Simulator::new(30).expect("simulator should be created");
+        simulator
+            .place_wall(2, 10, 12, 10)
+            .expect("first wall should be placed");
+        simulator
+            .place_wall(7, 5, 7, 15)
+            .expect("crossing wall should be placed");
+        simulator
+            .place_building(BuildingType::Armoury, 16, 8)
+            .expect("building should be placed");
+
+        let result = simulator.place_wall(14, 10, 22, 10);
+        assert!(matches!(
+            result,
+            Err(SimulatorError::Map(MapError::Occupied))
+        ));
+    }
+
+    #[test]
     fn rejects_diagonal_wall() {
         let mut simulator = Simulator::new(20).expect("simulator should be created");
         let result = simulator.place_wall(1, 1, 3, 2);
@@ -1195,6 +1498,337 @@ mod tests {
             .entry_point
             .expect("entry point should still exist after recalculation");
         assert_eq!(updated_entry, EntryPoint { x: 7, y: 5 });
+    }
+
+    #[test]
+    fn enclosed_workshop_skips_empty_trapped_gap_and_uses_open_corner() {
+        let mut simulator = Simulator::new(40).expect("map");
+        // Screenshot layout: three solid sides, one empty bottom tile, and a free upper corner.
+        for (sx, sy, ex, ey) in [
+            (9, 14, 13, 14),
+            (9, 8, 9, 13),
+            (14, 8, 14, 13),
+            (9, 8, 14, 8),
+            (10, 9, 11, 9),
+            (13, 9, 13, 9),
+        ] {
+            simulator.place_wall(sx, sy, ex, ey).expect("wall");
+        }
+        simulator
+            .place_building(BuildingType::FletchersWorkshop, 10, 10)
+            .expect("workshop");
+        assert_eq!(
+            simulator.buildings()[0].entry_point,
+            Some(EntryPoint { x: 14, y: 14 })
+        );
+
+        simulator.place_wall(12, 9, 12, 9).expect("fill gap");
+        assert_eq!(
+            simulator.buildings()[0].entry_point,
+            Some(EntryPoint { x: 14, y: 14 })
+        );
+
+        simulator
+            .place_wall(14, 14, 14, 14)
+            .expect("close final corner");
+        assert_eq!(simulator.buildings()[0].entry_point, None);
+
+        simulator.remove_at(14, 14);
+        assert_eq!(
+            simulator.buildings()[0].entry_point,
+            Some(EntryPoint { x: 14, y: 14 })
+        );
+    }
+
+    #[test]
+    fn sealing_workshop_corridor_reroutes_both_entries_to_reachable_corners() {
+        for block_with_building in [false, true] {
+            let mut simulator = Simulator::new(40).expect("map");
+            simulator.set_defer_path_calculation(true);
+            let right_x = if block_with_building { 16 } else { 15 };
+            let a = simulator
+                .place_building(BuildingType::FletchersWorkshop, 10, 10)
+                .expect("left workshop");
+            let b = simulator
+                .place_building(BuildingType::FletchersWorkshop, right_x, 10)
+                .expect("right workshop");
+            let armoury = simulator
+                .place_building(BuildingType::Armoury, 25, 20)
+                .expect("armoury");
+            let stock = simulator
+                .place_building(BuildingType::GoodsYard, 2, 20)
+                .expect("yard");
+            simulator
+                .set_stockpile_resource_at(2, 20, StockpileResource::Wood)
+                .expect("wood");
+            for (sx, sy, ex, ey) in [
+                (9, 9, right_x + 4, 9),
+                (9, 10, 9, 13),
+                (right_x + 4, 10, right_x + 4, 13),
+                (10, 14, 13, 14),
+                (right_x, 14, right_x + 3, 14),
+            ] {
+                simulator.place_wall(sx, sy, ex, ey).expect("wall");
+            }
+            let original_entries = [
+                simulator.buildings()[0].entry_point,
+                simulator.buildings()[1].entry_point,
+            ];
+            let source_entries = simulator.buildings()[2..]
+                .iter()
+                .map(|b| b.entry_point)
+                .collect::<Vec<_>>();
+            simulator.calculate_worker_distances();
+            assert!(
+                simulator
+                    .distance_between(a, stock)
+                    .expect("route")
+                    .distance_cells
+                    .is_some()
+            );
+            assert!(
+                simulator
+                    .distance_between(b, armoury)
+                    .expect("route")
+                    .distance_cells
+                    .is_some()
+            );
+
+            if block_with_building {
+                simulator
+                    .place_building(BuildingType::Stockpile, 14, 14)
+                    .expect("seal with stockpile");
+            } else {
+                simulator
+                    .place_wall(14, 14, 14, 14)
+                    .expect("seal with one wall cell");
+            }
+            for entry in original_entries.into_iter().flatten() {
+                assert!(
+                    !simulator.map.is_blocked(entry.x, entry.y),
+                    "old entrance tile itself is still empty"
+                );
+                let stock_entry = simulator
+                    .buildings()
+                    .iter()
+                    .find(|b| b.id == stock)
+                    .and_then(|b| b.entry_point)
+                    .expect("stock entrance");
+                assert_eq!(
+                    crate::simulation::pathfinding::shortest_path_len(
+                        &simulator.map,
+                        entry,
+                        stock_entry
+                    ),
+                    None
+                );
+            }
+            assert_eq!(
+                simulator.buildings()[0].entry_point,
+                Some(EntryPoint { x: 9, y: 14 })
+            );
+            assert_eq!(
+                simulator.buildings()[1].entry_point,
+                Some(EntryPoint {
+                    x: right_x + 4,
+                    y: 14
+                })
+            );
+            assert_eq!(
+                simulator.buildings()[2..2 + source_entries.len()]
+                    .iter()
+                    .map(|b| b.entry_point)
+                    .collect::<Vec<_>>(),
+                source_entries
+            );
+            simulator.calculate_worker_distances();
+            for id in [a, b] {
+                for destination in [stock, armoury] {
+                    assert!(
+                        simulator
+                            .distance_between(id, destination)
+                            .expect("route")
+                            .distance_cells
+                            .is_some()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reopening_one_diagonal_cell_restores_entrance_for_every_square_building() {
+        for kind in [
+            BuildingType::Stockpile,
+            BuildingType::Windmill,
+            BuildingType::Armoury,
+            BuildingType::Granary,
+            BuildingType::Bakery,
+            BuildingType::FletchersWorkshop,
+            BuildingType::BlacksmithsWorkshop,
+            BuildingType::PoleturnersWorkshop,
+            BuildingType::ArmourersWorkshop,
+        ] {
+            let mut simulator = Simulator::new(40).expect("map");
+            simulator.place_building(kind, 10, 10).expect("building");
+            let size = simulator.buildings()[0].width() as i32;
+            for (sx, sy, ex, ey) in [
+                (9, 9, 10 + size, 9),
+                (9, 10 + size, 10 + size, 10 + size),
+                (9, 10, 9, 9 + size),
+                (10 + size, 10, 10 + size, 9 + size),
+            ] {
+                simulator.place_wall(sx, sy, ex, ey).expect("wall");
+            }
+            assert_eq!(simulator.buildings()[0].entry_point, None);
+            simulator.remove_at(9, 10 + size);
+            assert_eq!(
+                simulator.buildings()[0].entry_point,
+                Some(EntryPoint { x: 9, y: 10 + size })
+            );
+        }
+    }
+
+    #[test]
+    fn removing_blocking_building_restores_previously_unavailable_workshop() {
+        let mut simulator = Simulator::new(40).expect("map");
+        simulator
+            .place_building(BuildingType::FletchersWorkshop, 10, 10)
+            .expect("workshop");
+        let left = simulator
+            .place_building(BuildingType::Armoury, 6, 10)
+            .expect("left blocker");
+        for (x, y) in [(14, 10), (10, 6), (10, 14)] {
+            simulator
+                .place_building(BuildingType::Armoury, x, y)
+                .expect("blocker");
+        }
+        for (x, y) in [(9, 9), (14, 9), (9, 14), (14, 14)] {
+            simulator.place_wall(x, y, x, y).expect("corner wall");
+        }
+        assert_eq!(simulator.buildings()[0].entry_point, None);
+        assert!(simulator.remove_building(left));
+        assert_eq!(
+            simulator.buildings()[0].entry_point,
+            Some(EntryPoint { x: 9, y: 10 })
+        );
+    }
+
+    #[test]
+    fn loading_layout_rechecks_blocked_saved_entries_and_preserves_open_ones() {
+        let mut simulator = Simulator::new(40).expect("map");
+        simulator
+            .place_building(BuildingType::FletchersWorkshop, 10, 10)
+            .expect("workshop");
+        simulator
+            .place_building(BuildingType::Armoury, 25, 25)
+            .expect("armoury");
+        let buildings = simulator
+            .buildings()
+            .iter()
+            .map(crate::SavedBuilding::from)
+            .collect();
+        let unaffected = simulator.buildings()[1].entry_point;
+        let restored = Simulator::from_saved_layout(
+            simulator.map_bounds(),
+            buildings,
+            vec![crate::WallSegment::new(1, 12, 9, 12, 9)],
+        )
+        .expect("saved layout");
+        assert_eq!(
+            restored.buildings()[0].entry_point,
+            Some(EntryPoint { x: 11, y: 9 })
+        );
+        assert_eq!(restored.buildings()[1].entry_point, unaffected);
+    }
+
+    #[test]
+    fn partial_wall_does_not_rotate_workshops() {
+        for kind in [
+            BuildingType::FletchersWorkshop,
+            BuildingType::BlacksmithsWorkshop,
+            BuildingType::PoleturnersWorkshop,
+            BuildingType::ArmourersWorkshop,
+            BuildingType::Bakery,
+        ] {
+            for wall in [(14, 10, 14, 12), (10, 9, 11, 9), (9, 10, 9, 12)] {
+                let mut simulator = Simulator::new(40).expect("map");
+                simulator
+                    .place_wall(wall.0, wall.1, wall.2, wall.3)
+                    .expect("wall");
+                simulator.place_building(kind, 10, 10).expect("workshop");
+                assert_eq!(
+                    simulator.buildings()[0].entry_point,
+                    Some(EntryPoint { x: 12, y: 9 })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_wall_rotates_then_searches_past_blocked_entry() {
+        let mut simulator = Simulator::new(40).expect("map");
+        // Partial contact on the right must not override the complete upper wall.
+        simulator.place_wall(14, 10, 14, 12).expect("partial wall");
+        for x in 10..14 {
+            simulator.place_wall(x, 9, x, 9).expect("wall cell");
+        }
+        simulator
+            .place_building(BuildingType::Armoury, 11, 14)
+            .expect("blocker");
+        simulator
+            .place_building(BuildingType::FletchersWorkshop, 10, 10)
+            .expect("workshop");
+        assert_eq!(
+            simulator.buildings()[1].entry_point,
+            Some(EntryPoint { x: 14, y: 13 })
+        );
+    }
+
+    #[test]
+    fn wall_cell_rechecks_blocked_entries_for_all_square_buildings() {
+        for kind in [
+            BuildingType::Stockpile,
+            BuildingType::Windmill,
+            BuildingType::Armoury,
+            BuildingType::Granary,
+            BuildingType::Bakery,
+            BuildingType::FletchersWorkshop,
+            BuildingType::BlacksmithsWorkshop,
+            BuildingType::PoleturnersWorkshop,
+            BuildingType::ArmourersWorkshop,
+        ] {
+            let mut simulator = Simulator::new(40).expect("map");
+            simulator.place_building(kind, 10, 10).expect("building");
+            simulator
+                .place_building(BuildingType::Armoury, 25, 25)
+                .expect("unaffected building");
+            let entry = simulator.buildings()[0].entry_point.expect("entry");
+            let unaffected = simulator.buildings()[1].entry_point;
+            simulator
+                .place_wall(entry.x, entry.y, entry.x, entry.y)
+                .expect("wall cell");
+            let updated = simulator.buildings()[0]
+                .entry_point
+                .expect("replacement entry");
+            assert_eq!(
+                updated,
+                EntryPoint {
+                    x: if kind == BuildingType::Stockpile {
+                        9
+                    } else {
+                        entry.x - 1
+                    },
+                    y: if kind == BuildingType::Stockpile {
+                        10
+                    } else {
+                        9
+                    }
+                }
+            );
+            assert!(!simulator.map.is_blocked(updated.x, updated.y));
+            assert_eq!(simulator.buildings()[1].entry_point, unaffected);
+        }
     }
 
     #[test]
@@ -1398,7 +2032,7 @@ mod tests {
         assert_eq!(before, None);
 
         let outcome = simulator.remove_at(8, 5);
-        assert!(matches!(outcome, RemoveOutcome::Wall { .. }));
+        assert!(matches!(outcome, RemoveOutcome::WallCell { .. }));
 
         let after = simulator
             .buildings()
@@ -1689,7 +2323,7 @@ mod tests {
         assert_eq!(cycle.route_usage[3].start_building_id, workshop_id);
         assert_eq!(cycle.route_usage[3].finish_building_id, armoury_id);
         assert_eq!(cycle.route_usage[3].trips, 1);
-        assert_eq!(cycle.total_ticks, cycle.travel_ticks + cycle.make_ticks);
+        assert_eq!(cycle.total_ticks, cycle.travel_ticks + cycle.work_ticks);
     }
 
     #[test]

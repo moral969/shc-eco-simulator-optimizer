@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::{
     buildings::{BuildingType, EntryPoint},
     map::CellMap,
@@ -17,7 +19,8 @@ pub(crate) fn calculate_building_entry(
     }
 
     if building_type == BuildingType::WheatFarm {
-        return Some(EntryPoint { x: x + 4, y: y + 3 });
+        let entry = EntryPoint { x: x + 4, y: y + 3 };
+        return entry_is_accessible(map, entry).then_some(entry);
     }
 
     let rotation_steps = if is_workshop(building_type) {
@@ -48,12 +51,63 @@ pub(crate) fn resolve_entry_point_for_square(
 
 fn first_available(map: &CellMap, cells: Vec<(i32, i32)>) -> Option<EntryPoint> {
     for (cx, cy) in cells {
-        if map.is_in_bounds(cx, cy) && !map.is_blocked(cx, cy) {
-            return Some(EntryPoint { x: cx, y: cy });
+        let entry = EntryPoint { x: cx, y: cy };
+        if entry_is_accessible(map, entry) {
+            return Some(entry);
         }
     }
 
     None
+}
+
+pub(crate) fn entry_is_accessible(map: &CellMap, entry: EntryPoint) -> bool {
+    if !map.is_in_bounds(entry.x, entry.y) || map.is_blocked(entry.x, entry.y) {
+        return false;
+    }
+
+    // A bounded eight-way search rejects sealed pockets without calculating economy routes.
+    const RADIUS: i32 = 6;
+    const WIDTH: usize = (RADIUS * 2 + 1) as usize;
+    let mut visited = [false; WIDTH * WIDTH];
+    let mut queue = VecDeque::new();
+    visited[RADIUS as usize * WIDTH + RADIUS as usize] = true;
+    queue.push_back((0i32, 0i32));
+    let bounds = map.bounds();
+
+    while let Some((dx, dy)) = queue.pop_front() {
+        let x = entry.x + dx;
+        let y = entry.y + dy;
+        if dx.abs() == RADIUS
+            || dy.abs() == RADIUS
+            || x == bounds.min_x
+            || y == bounds.min_y
+            || x == bounds.max_x - 1
+            || y == bounds.max_y - 1
+        {
+            return true;
+        }
+        for step_y in -1..=1 {
+            for step_x in -1..=1 {
+                if step_x == 0 && step_y == 0 {
+                    continue;
+                }
+                let nx = dx + step_x;
+                let ny = dy + step_y;
+                let index = (ny + RADIUS) as usize * WIDTH + (nx + RADIUS) as usize;
+                if visited[index] {
+                    continue;
+                }
+                visited[index] = true;
+                let (Some(x), Some(y)) = (entry.x.checked_add(nx), entry.y.checked_add(ny)) else {
+                    continue;
+                };
+                if map.is_in_bounds(x, y) && !map.is_blocked(x, y) {
+                    queue.push_back((nx, ny));
+                }
+            }
+        }
+    }
+    false
 }
 
 fn workshop_wall_rotation_steps(walls: &[WallSegment], x: i32, y: i32, size: usize) -> usize {
@@ -78,7 +132,7 @@ fn workshop_wall_rotation_steps(walls: &[WallSegment], x: i32, y: i32, size: usi
 }
 
 fn side_has_wall_contact(walls: &[WallSegment], cells: Vec<(i32, i32)>) -> bool {
-    cells.into_iter().any(|(x, y)| is_wall_at(walls, x, y))
+    !cells.is_empty() && cells.into_iter().all(|(x, y)| is_wall_at(walls, x, y))
 }
 
 fn is_wall_at(walls: &[WallSegment], x: i32, y: i32) -> bool {
@@ -140,10 +194,10 @@ fn side_perimeter_cells_clockwise(
         ring.push((right, cy));
     }
 
-    if let Some(start_cell) = start {
-        if let Some(idx) = ring.iter().position(|cell| *cell == start_cell) {
-            ring.rotate_left(idx);
-        }
+    if let Some(start_cell) = start
+        && let Some(idx) = ring.iter().position(|cell| *cell == start_cell)
+    {
+        ring.rotate_left(idx);
     }
 
     ring

@@ -1,0 +1,14 @@
+{
+  "backup_date": "2026-10-14",
+  "source_file": "simulator/src/simulation/production_cycle.rs",
+  "description": "Previous workshop animation timings before applying the user-supplied DLL findings. These are crafting ticks only; resource collection and Armoury delivery travel are added separately.",
+  "make_time_ticks": {
+    "bow": 638,
+    "crossbow": 565,
+    "spear": 332,
+    "pike": 872,
+    "sword": 1090,
+    "mace": 910,
+    "armor": 625
+  }
+}
