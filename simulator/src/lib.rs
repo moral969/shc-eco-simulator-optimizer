@@ -3,6 +3,7 @@ pub mod map;
 mod project;
 pub mod simulation;
 pub mod walls;
+pub mod optimizer;
 
 pub use buildings::{
     BuildingComponent, BuildingComponentType, BuildingCost, BuildingPlacement, BuildingType,
@@ -21,5 +22,8 @@ pub use simulation::{
     wheat_output_per_farm_cycle,
 };
 pub use walls::WallSegment;
+pub use optimizer::{
+    OptimizationResult, Optimizer, OptimizerConfig, OptimizerEvent, OptimizerHandle, PlanStep,
+};
 
 pub const DEFAULT_MAP_SIZE: usize = 100;

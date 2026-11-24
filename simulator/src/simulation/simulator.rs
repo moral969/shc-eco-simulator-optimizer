@@ -692,6 +692,23 @@ impl Simulator {
         Ok(target_id)
     }
 
+    /// Toggle the anchored flag on a building occupying the given cell.
+    /// Returns `Ok(true)` if the flag was flipped, `Ok(false)` if no building was found.
+    pub fn toggle_anchor_at(&mut self, x: i32, y: i32) -> Result<bool, SimulatorError> {
+        let Some(target) = self.buildings.iter_mut().find(|building| {
+            building.occupied_cells().any(|cell| cell == (x, y))
+        }) else {
+            return Ok(false);
+        };
+        target.anchored = !target.anchored;
+        Ok(true)
+    }
+
+    /// Returns true if any building is anchored.
+    pub fn has_anchors(&self) -> bool {
+        self.buildings.iter().any(|b| b.anchored)
+    }
+
     fn assign_entry_points(&self, placement: &mut BuildingPlacement) {
         placement.entry_point = calculate_building_entry(
             &self.map,

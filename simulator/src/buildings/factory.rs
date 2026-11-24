@@ -33,6 +33,7 @@ impl BuildingFactory {
             wheat_layout: 0,
             footprint: Footprint::for_type(building_type),
             components: Vec::new(),
+            anchored: false,
         };
         self.next_id += 1;
         placement
@@ -54,6 +55,7 @@ impl BuildingFactory {
                 wheat_layout: 0,
                 footprint: Footprint::for_type(BuildingType::Stockpile),
                 components: Vec::new(),
+                anchored: false,
             };
             self.next_id += 1;
             placement

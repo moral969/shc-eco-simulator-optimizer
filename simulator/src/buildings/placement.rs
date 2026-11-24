@@ -12,6 +12,7 @@ pub struct BuildingPlacement {
     pub wheat_layout: u8,
     pub footprint: Footprint,
     pub components: Vec<BuildingComponent>,
+    pub anchored: bool,
 }
 
 impl BuildingPlacement {

@@ -7,7 +7,7 @@ use crate::{
     SimulationSettings, Simulator, SimulatorError, StockpileResource, WallSegment,
 };
 
-pub const PROJECT_FORMAT_VERSION: u32 = 2;
+pub const PROJECT_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectFile {
@@ -36,6 +36,8 @@ pub struct SavedBuilding {
     pub entry_point: Option<EntryPoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wheat_layout: Option<u8>,
+    #[serde(default)]
+    pub anchored: bool,
 }
 
 impl ProjectFile {
@@ -107,6 +109,7 @@ impl From<&BuildingPlacement> for SavedBuilding {
             entry_point: building.entry_point,
             wheat_layout: (building.building_type == BuildingType::WheatFarm)
                 .then_some(building.wheat_layout),
+                anchored: building.anchored,
         }
     }
 }
@@ -124,6 +127,7 @@ impl SavedBuilding {
             wheat_layout: self.wheat_layout.unwrap_or(0),
             footprint: Footprint::for_type(self.building_type),
             components: Vec::new(),
+            anchored: self.anchored,
         }
     }
 }
