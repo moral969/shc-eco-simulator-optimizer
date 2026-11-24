@@ -1,11 +1,13 @@
 use std::{
+    cell::RefCell,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    rc::Rc,
+    sync::{Arc, Mutex, atomic::Ordering, mpsc::TryRecvError},
 };
 
 use simulator::{
     BREAD_SELL_GOLD, BuildingType, FLOUR_BUY_GOLD, FLOUR_SELL_GOLD, WHEAT_BUY_GOLD,
-    WHEAT_SELL_GOLD, WOOD_BUY_GOLD, WeaponType,
+    WHEAT_SELL_GOLD, WOOD_BUY_GOLD, WeaponType, Optimizer, OptimizerConfig, OptimizerEvent, OptimizerHandle,
 };
 use slint::{ComponentHandle, ModelRc, VecModel};
 
@@ -673,6 +675,162 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             refresh_view(&window, &state, &message);
         }
     });
+    // ---------------- Optimizer ----------------
+    let optimizer_slot: Rc<RefCell<Option<OptimizerHandle>>> = Rc::new(RefCell::new(None));
+    let optimizer_log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let weak_window = window.as_weak();
+    window.on_set_optimizer_iterations(move |text| {
+        if let (Some(w), Some(v)) = (weak_window.upgrade(), parse_positive(text.as_str())) {
+            w.set_optimizer_iterations(v);
+        }
+    });
+    let weak_window = window.as_weak();
+    window.on_set_optimizer_threads(move |text| {
+        if let (Some(w), Some(v)) = (weak_window.upgrade(), parse_positive(text.as_str())) {
+            w.set_optimizer_threads(v);
+        }
+    });
+    let weak_window = window.as_weak();
+    window.on_set_optimizer_top_solutions(move |text| {
+        if let (Some(w), Some(v)) = (weak_window.upgrade(), parse_positive(text.as_str())) {
+            w.set_optimizer_top_solutions(v);
+        }
+    });
+
+    {
+        let weak_window = window.as_weak();
+        let state = Arc::clone(&state);
+        let slot = Rc::clone(&optimizer_slot);
+        let log = Rc::clone(&optimizer_log);
+        window.on_run_optimizer(move || {
+            let Some(window) = weak_window.upgrade() else { return };
+            if slot.borrow().is_some() {
+                return;
+            }
+            let (layout, settings, population) = {
+                let guard = state
+                    .lock()
+                    .expect("editor state lock should not be poisoned");
+                (
+                    guard.simulator().clone(),
+                    guard.simulation_settings(),
+                    guard.population_economy_settings(),
+                )
+            };
+            let config = OptimizerConfig {
+                max_iterations: window.get_optimizer_iterations().max(1) as usize,
+                threads: window.get_optimizer_threads().max(1) as usize,
+                top_n: window.get_optimizer_top_solutions().max(1) as usize,
+                ..OptimizerConfig::default()
+            };
+            *slot.borrow_mut() = Some(Optimizer::start(config, settings, population, layout));
+            log.borrow_mut().clear();
+            window.set_optimizer_log("".into());
+            window.set_optimizer_running(true);
+            window.set_optimizer_status("Запуск...".into());
+        });
+    }
+
+    {
+        let slot = Rc::clone(&optimizer_slot);
+        window.on_stop_optimizer(move || {
+            if let Some(handle) = slot.borrow().as_ref() {
+                handle.cancel.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+
+    {
+        let weak_window = window.as_weak();
+        let state = Arc::clone(&state);
+        let backend = backend.clone();
+        window.on_apply_optimizer_best(move || {
+            if let Some(window) = weak_window.upgrade() {
+                let path = OptimizerConfig::default().output_dir.join("top_01.json");
+                apply_optimizer_best(&window, &state, &backend, &path);
+            }
+        });
+    }
+
+    // Опрос событий оптимизатора из UI-потока.
+    let optimizer_timer = slint::Timer::default();
+    {
+        let weak_window = window.as_weak();
+        let slot = Rc::clone(&optimizer_slot);
+        let log = Rc::clone(&optimizer_log);
+        optimizer_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(250),
+            move || {
+                let Some(window) = weak_window.upgrade() else { return };
+                let mut finished = false;
+                let mut log_changed = false;
+                if let Some(handle) = slot.borrow().as_ref() {
+                    loop {
+                        match handle.events.try_recv() {
+                            Ok(OptimizerEvent::Log(line)) => {
+                                log.borrow_mut().insert(0, line);
+                                log_changed = true;
+                            }
+                            Ok(OptimizerEvent::Progress {
+                                elapsed_s,
+                                evaluated,
+                                per_sec,
+                                done,
+                                best,
+                            }) => {
+                                window.set_optimizer_status(
+                                    format!(
+                                        "{:.0}% | оценок: {} ({:.0}/с) | лучшее: {} gold/min | {:.0} с",
+                                        done * 100.0,
+                                        evaluated,
+                                        per_sec,
+                                        best.map_or("-".to_string(), |b| format!("{b:.2}")),
+                                        elapsed_s
+                                    )
+                                    .into(),
+                                );
+                            }
+                            Ok(OptimizerEvent::Finished {
+                                best,
+                                evaluated,
+                                elapsed_s,
+                                output_dir,
+                            }) => {
+                                log.borrow_mut().insert(
+                                    0,
+                                    format!(
+                                        "Готово: лучшее {} gold/min, оценок {}, {:.0} с. Файлы: {}",
+                                        best.map_or("-".to_string(), |b| format!("{b:.2}")),
+                                        evaluated,
+                                        elapsed_s,
+                                        output_dir.display()
+                                    ),
+                                );
+                                log_changed = true;
+                                finished = true;
+                                break;
+                            }
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                finished = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if finished {
+                    *slot.borrow_mut() = None;
+                    window.set_optimizer_running(false);
+                }
+                if log_changed {
+                    log.borrow_mut().truncate(300);
+                    window.set_optimizer_log(log.borrow().join("\n").into());
+                }
+            },
+        );
+    }
 
     window.run()?;
     Ok(())
@@ -794,6 +952,51 @@ fn buy_setting_message(resource: &str, enabled: bool, changed: bool) -> &'static
     }
 }
 
+fn parse_positive(text: &str) -> Option<i32> {
+    text.trim().parse::<i32>().ok().filter(|v| *v > 0)
+}
+
+fn apply_optimizer_best(
+    window: &MainWindow,
+    state: &Arc<Mutex<EditorState>>,
+    backend: &BackendHandle,
+    path: &std::path::Path,
+) {
+    let project = match std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|json| {
+            serde_json::from_str::<simulator::ProjectFile>(&json).map_err(|e| e.to_string())
+        }) {
+        Ok(project) => project,
+        Err(error) => {
+            window.set_status_text(format!("Не удалось прочитать {}: {error}", path.display()).into());
+            return;
+        }
+    };
+    let (layout, settings, population) = match project.into_simulator() {
+        Ok(v) => v,
+        Err(error) => {
+            window.set_status_text(format!("Некорректное решение: {error}").into());
+            return;
+        }
+    };
+    if let Err(error) = backend.send(BackendCommand::LoadProject {
+        simulator: Box::new(layout),
+        settings,
+    }) {
+        window.set_status_text(error.into());
+        return;
+    }
+    let mut guard = state
+        .lock()
+        .expect("editor state lock should not be poisoned");
+    guard.set_simulation_settings(settings);
+    guard.set_population_economy_settings(population);
+    guard.mark_simulation_results_stale();
+    guard.clear_selection();
+    refresh_geometry_view(window, &guard, "Лучшее решение оптимизатора загружено, пересчёт...");
+}
+
 fn parse_count(text: &str, label: &str) -> Result<u32, String> {
     text.trim()
         .parse::<u32>()
@@ -872,6 +1075,11 @@ fn refresh_static_view(window: &MainWindow, state: &EditorState) {
     window.set_building_boundaries(ModelRc::new(boundary_model));
 
     let anchor_labels = visuals::build_anchor_labels(state.simulator());
+    // Note: we reuse the existing `anchor-labels` Slint property to show both
+    // building IDs AND anchor markers. For simplicity, anchor markers are drawn
+    // as a separate overlay using the same property but with a different prefix.
+    // If you want a dedicated property, add `in property <[MapMarker]> anchor-markers;`
+    // to main.slint and set it here.
     let anchor_model = VecModel::from(anchor_labels);
     window.set_anchor_labels(ModelRc::new(anchor_model));
 

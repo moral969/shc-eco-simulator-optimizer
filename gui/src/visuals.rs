@@ -24,15 +24,20 @@ pub fn build_occupied_cells(simulator: &Simulator) -> Vec<OccupiedCellVisual> {
     let mut cells = Vec::new();
 
     for building in simulator.buildings() {
-        let color = building_color(building.building_type);
         for (x, y) in building.occupied_cells() {
-            let color = if building.building_type == BuildingType::WheatFarm
+            let base_color = if building.building_type == BuildingType::WheatFarm
                 && x < building.x + 3
                 && y >= building.y + 6
             {
                 slint::Color::from_rgb_u8(132, 92, 55)
             } else {
-                color
+                building_color(building.building_type)
+            };
+            // Если здание заякорено — красим его в магентовый.
+            let color = if building.anchored {
+                slint::Color::from_argb_u8(230, 217, 70, 239)
+            } else {
+                base_color
             };
             cells.push(OccupiedCellVisual { x, y, color });
         }
@@ -50,6 +55,24 @@ pub fn build_occupied_cells(simulator: &Simulator) -> Vec<OccupiedCellVisual> {
     }
 
     cells
+}
+
+pub fn build_anchor_markers(simulator: &Simulator) -> Vec<MapMarker> {
+    let mut result = Vec::new();
+    let anchor_color = slint::Color::from_argb_u8(230, 217, 70, 239);
+    for building in simulator.buildings() {
+        if !building.anchored {
+            continue;
+        }
+        result.push(MapMarker {
+            x: building.x,
+            y: building.y,
+            text: "⚓".into(),
+            color: slint::Color::from_rgb_u8(255, 255, 255),
+            bg: anchor_color,
+        });
+    }
+    result
 }
 
 pub fn build_preview_cells(cells: &[(i32, i32)]) -> Vec<OccupiedCellVisual> {
@@ -151,17 +174,28 @@ fn append_boundary_edges(
 
 pub fn build_anchor_labels(simulator: &Simulator) -> Vec<MapMarker> {
     let mut result = Vec::new();
-
     for building in simulator.buildings() {
+        let (text, color, bg) = if building.anchored {
+            (
+                format!("⚓{}", building.id),
+                slint::Color::from_rgb_u8(255, 255, 255),
+                slint::Color::from_argb_u8(230, 217, 70, 239),
+            )
+        } else {
+            (
+                building.id.to_string(),
+                slint::Color::from_rgb_u8(20, 20, 20),
+                slint::Color::from_argb_u8(0, 0, 0, 0),
+            )
+        };
         result.push(MapMarker {
             x: building.x,
             y: building.y,
-            text: building.id.to_string().into(),
-            color: slint::Color::from_rgb_u8(20, 20, 20),
-            bg: slint::Color::from_argb_u8(0, 0, 0, 0),
+            text: text.into(),
+            color,
+            bg,
         });
     }
-
     result
 }
 

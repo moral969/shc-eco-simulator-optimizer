@@ -12,6 +12,7 @@ enum SelectedTool {
     SetIronStock,
     SetWheatStock,
     SetFlourStock,
+    Anchor,
 }
 
 pub enum PlacementOutcome {
@@ -81,12 +82,18 @@ impl EditorState {
             Some(SelectedTool::SetIronStock) => Some("set_iron_stock"),
             Some(SelectedTool::SetWheatStock) => Some("set_wheat_stock"),
             Some(SelectedTool::SetFlourStock) => Some("set_flour_stock"),
+            Some(SelectedTool::Anchor) => Some("anchor"),
             None => None,
         }
     }
 
     pub fn set_selected_from_id(&mut self, value: &str) -> bool {
         self.wall_start = None;
+
+        if value == "anchor" {
+            self.selected = Some(SelectedTool::Anchor);
+            return true;
+        }
 
         if value == "wall" {
             self.selected = Some(SelectedTool::Wall);
@@ -138,6 +145,7 @@ impl EditorState {
             Some(SelectedTool::SetIronStock) => "Set Iron Stock",
             Some(SelectedTool::SetWheatStock) => "Set Wheat Stock",
             Some(SelectedTool::SetFlourStock) => "Set Flour Stock",
+            Some(SelectedTool::Anchor) => "Anchor",
             None => "None",
         }
     }
@@ -198,6 +206,7 @@ impl EditorState {
             Some(SelectedTool::SetFlourStock) => {
                 self.mark_stockpile(x, y, StockpileResource::Flour)
             }
+            Some(SelectedTool::Anchor) => self.toggle_anchor(x, y),
             None => Err("no tool selected".to_string()),
         }
     }
@@ -470,6 +479,11 @@ impl EditorState {
         self.simulation_settings.blacksmiths_weapon
     }
 
+    fn toggle_anchor(&mut self, x: i32, y: i32) -> Result<PlacementOutcome, String> {
+        self.wall_start = None;
+        Ok(PlacementOutcome::BackendCommand(BackendCommand::ToggleAnchor { x, y }))
+    }
+
     pub fn clear_pending_wall(&mut self) {
         self.wall_start = None;
     }
@@ -516,11 +530,12 @@ impl EditorState {
                 }
                 vec![(anchor_x, anchor_y)]
             }
-            Some(SelectedTool::Remove)
-            | Some(SelectedTool::SetWoodStock)
-            | Some(SelectedTool::SetIronStock)
-            | Some(SelectedTool::SetWheatStock)
-            | Some(SelectedTool::SetFlourStock) => vec![(anchor_x, anchor_y)],
+          Some(SelectedTool::Remove)
+        | Some(SelectedTool::SetWoodStock)
+        | Some(SelectedTool::SetIronStock)
+        | Some(SelectedTool::SetWheatStock)
+        | Some(SelectedTool::SetFlourStock)
+        | Some(SelectedTool::Anchor) => vec![(anchor_x, anchor_y)],
             None => Vec::new(),
         }
     }

@@ -1,4 +1,4 @@
-import { Button, CheckBox, HorizontalBox, LineEdit, ScrollView, Slider, TextEdit, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, HorizontalBox, LineEdit, Palette, ScrollView, Slider, TextEdit, VerticalBox } from "std-widgets.slint";
 
 export struct OccupiedCellVisual {
     x: int,
@@ -60,6 +60,8 @@ component BuildingButton inherits Rectangle {
         }
 
         Text {
+
+            color: #1f2937;
             text: root.title;
             vertical-alignment: center;
             wrap: word-wrap;
@@ -445,6 +447,8 @@ component ToolButton inherits Rectangle {
         }
 
         Text {
+
+            color: #1f2937;
             text: root.title;
             vertical-alignment: center;
             wrap: word-wrap;
@@ -470,9 +474,11 @@ component ToolButton inherits Rectangle {
 
 export component MainWindow inherits Window {
     preferred-width: 1360px;
-    preferred-height: 940px;
-    min-width: 1360px;
-    min-height: 820px;
+    preferred-height: 900px;
+    min-width: 1100px;
+    // Фиксированные блоки (toolbar 42 + разделитель 6 + Simulation 340 + Optimizer 190 + отступы) ~654px,
+    // плюс минимум 120px под карту.
+    min-height: 780px;
     title: "SHC Eco Simulator - " + root.current-project-name;
 
     in property <int> map-min-x: 0;
@@ -592,14 +598,25 @@ export component MainWindow inherits Window {
 
     private property <length> outer-padding: 12px;
     private property <length> panel-gap: 12px;
-    private property <length> assets-panel-width: 250px;
-    private property <length> info-panel-width: 360px;
-    private property <length> map-panel-width: 700px;
-    private property <length> map-frame-width: root.map-panel-width - 20px;
-    private property <length> map-frame-height: 300px;
+    private property <length> assets-panel-width: max(190px, min(250px, root.width * 0.19));
+    private property <length> info-panel-width: max(250px, min(320px, root.width * 0.24));
+    private property <length> map-panel-width: max(1px, root.width - root.assets-panel-width - root.info-panel-width - root.outer-padding * 2 - root.panel-gap * 2);
+    private property <length> simulation-block-height: 340px;
+    private property <length> optimizer-block-height: 190px;
     private property <length> workspace-top: 12px;
 
-    init => { content-scope.focus(); }
+    // Высота карты, которую задаёт пользователь (тянется за разделитель).
+    private property <length> map-user-height: 300px;
+    // Всё, что занимает место кроме карты: отступы окна и панели, toolbar, разделитель, блоки, spacing.
+    private property <length> map-reserved-height: root.workspace-top + root.outer-padding + 20px + 42px + 6px + root.simulation-block-height + root.optimizer-block-height + 32px;
+    private property <length> map-max-height: max(120px, root.height - root.map-reserved-height);
+    // Фактическая высота карты: не меньше 120px и не больше, чем влезает в окно.
+    private property <length> map-effective-height: max(120px, min(root.map-user-height, root.map-max-height));
+
+    init => {
+        Palette.color-scheme = ColorScheme.light;
+        content-scope.focus();
+    }
 
     MenuBar {
         Menu {
@@ -762,6 +779,8 @@ export component MainWindow inherits Window {
             }
 
             Text {
+
+                color: #1f2937;
                 text: "Buildings";
                 font-size: 18px;
                 font-weight: 600;
@@ -904,7 +923,9 @@ export component MainWindow inherits Window {
         VerticalBox {
             padding: 10px;
             spacing: 8px;
+            alignment: start;
 
+            // --- Toolbar (фиксированная высота) ---
             Rectangle {
                 min-height: 42px;
                 max-height: 42px;
@@ -930,6 +951,8 @@ export component MainWindow inherits Window {
                 }
 
                 Text {
+
+                    color: #1f2937;
                     x: 82px;
                     y: 0px;
                     width: 76px;
@@ -988,19 +1011,20 @@ export component MainWindow inherits Window {
                 }
             }
 
+            // --- Карта: высота задаётся пользователем через разделитель ---
             HorizontalBox {
-                Rectangle {
-                    horizontal-stretch: 1;
-                    background: transparent;
-                }
+                min-height: root.map-effective-height;
+                max-height: root.map-effective-height;
+                padding: 0px;
 
                 Rectangle {
-                    width: root.map-frame-width;
-                    height: root.map-frame-height;
+                    horizontal-stretch: 1;
+                    vertical-stretch: 1;
                     border-width: 1px;
                     border-color: #dde3ea;
                     border-radius: 8px;
                     background: #f2f4f6;
+                    clip: true;
 
                     canvas-key-scope := FocusScope {
                         width: 100%;
@@ -1281,30 +1305,61 @@ export component MainWindow inherits Window {
                     }
                     }
                 }
+            }
 
-                Rectangle {
-                    horizontal-stretch: 1;
-                    background: transparent;
+            // --- Разделитель: зажмите и тяните вверх/вниз, чтобы менять высоту карты ---
+            Rectangle {
+                min-height: 6px;
+                max-height: 6px;
+                border-radius: 3px;
+                background: splitter-touch.has-hover || splitter-touch.pressed ? #9ab6dc : #d3d9e2;
+
+                splitter-touch := TouchArea {
+                    mouse-cursor: ns-resize;
+
+                    property <length> press-y: 0px;
+
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                            self.press-y = self.mouse-y;
+                        }
+                    }
+
+                    moved => {
+                        if self.pressed {
+                            // Разделитель двигается вместе с картой, поэтому дельта считается инкрементально.
+                            root.map-user-height = max(
+                                120px,
+                                min(root.map-max-height, root.map-effective-height + (self.mouse-y - self.press-y)),
+                            );
+                        }
+                    }
                 }
             }
 
+            // --- Simulation (фиксированная высота) ---
             Rectangle {
-                vertical-stretch: 1;
+                min-height: root.simulation-block-height;
+                max-height: root.simulation-block-height;
                 border-width: 1px;
                 border-color: #d9dde2;
                 border-radius: 8px;
                 background: #ffffff;
+                clip: true;
 
                 VerticalBox {
                     padding: 14px;
                     spacing: 10px;
+                    alignment: start;
 
                     HorizontalBox {
+                        padding: 0px;
                         min-height: 42px;
                         max-height: 42px;
                         spacing: 10px;
 
                         VerticalBox {
+                            padding: 0px;
                             spacing: 1px;
                             alignment: start;
 
@@ -1335,6 +1390,7 @@ export component MainWindow inherits Window {
                     }
 
                     HorizontalBox {
+                        padding: 0px;
                         spacing: 8px;
                         min-height: 50px;
                         max-height: 50px;
@@ -1368,6 +1424,7 @@ export component MainWindow inherits Window {
                     }
 
                     HorizontalBox {
+                        padding: 0px;
                         spacing: 10px;
                         min-height: 28px;
                         max-height: 28px;
@@ -1397,6 +1454,7 @@ export component MainWindow inherits Window {
                     }
 
                     HorizontalBox {
+                        padding: 0px;
                         spacing: 10px;
                         min-height: 48px;
                         max-height: 48px;
@@ -1425,12 +1483,16 @@ export component MainWindow inherits Window {
                     }
 
                     VerticalBox {
+                        padding: 0px;
                         spacing: 6px;
                         min-height: 90px;
                         max-height: 90px;
 
                         HorizontalBox {
+                            padding: 0px;
                             spacing: 8px;
+                            min-height: 42px;
+                            max-height: 42px;
 
                             BuyResourceToggle {
                                 title: "Buy Wood";
@@ -1448,7 +1510,10 @@ export component MainWindow inherits Window {
                         }
 
                         HorizontalBox {
+                            padding: 0px;
                             spacing: 8px;
+                            min-height: 42px;
+                            max-height: 42px;
 
                             BuyResourceToggle {
                                 title: "Buy Wheat";
@@ -1465,77 +1530,116 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
+                }
+            }
 
-                    Rectangle {
-                        vertical-stretch: 1;
-                        min-height: 150px;
-                        border-width: 1px;
-                        border-color: #d3d9e2;
-                        border-radius: 6px;
-                        background: #fbfcfe;
+            // --- Optimizer (фиксированная высота) ---
+            Rectangle {
+                min-height: root.optimizer-block-height;
+                max-height: root.optimizer-block-height;
+                border-width: 1px;
+                border-color: #d3d9e2;
+                border-radius: 6px;
+                background: #fbfcfe;
+                clip: true;
 
-                        VerticalBox {
-                            padding: 8px;
-                            spacing: 6px;
+                VerticalBox {
+                    padding: 8px;
+                    spacing: 6px;
 
-                            HorizontalBox {
-                                spacing: 6px;
-                                min-height: 28px;
-                                max-height: 28px;
+                    HorizontalBox {
+                        spacing: 6px;
+                        padding: 0px;
+                        min-height: 28px;
+                        max-height: 28px;
 
-                                Text { text: "Iter/thread"; vertical-alignment: center; font-size: 11px; }
-                                LineEdit {
-                                    width: 70px;
-                                    enabled: !root.optimizer-running;
-                                    text: "" + root.optimizer-iterations;
-                                    edited(t) => { root.set-optimizer-iterations(t); }
-                                }
-                                Text { text: "Threads"; vertical-alignment: center; font-size: 11px; }
-                                LineEdit {
-                                    width: 44px;
-                                    enabled: !root.optimizer-running;
-                                    text: "" + root.optimizer-threads;
-                                    edited(t) => { root.set-optimizer-threads(t); }
-                                }
-                                Text { text: "Top N"; vertical-alignment: center; font-size: 11px; }
-                                LineEdit {
-                                    width: 44px;
-                                    enabled: !root.optimizer-running;
-                                    text: "" + root.optimizer-top-solutions;
-                                    edited(t) => { root.set-optimizer-top-solutions(t); }
-                                }
-                            }
-
-                            HorizontalBox {
-                                spacing: 6px;
-                                min-height: 34px;
-                                max-height: 34px;
-
-                                PrimaryActionButton {
-                                    title: root.optimizer-running ? "Optimizing..." : "Optimize Layout";
-                                    pressed => { if !root.optimizer-running { root.run-optimizer(); } }
-                                }
-                                Button { text: "Stop"; enabled: root.optimizer-running; clicked => { root.stop-optimizer(); } }
-                                Button { text: "Apply best"; clicked => { root.apply-optimizer-best(); } }
-                            }
-
-                            Text {
-                                text: root.optimizer-status;
-                                font-size: 11px;
-                                color: #475569;
-                                overflow: elide;
-                                min-height: 16px;
-                                max-height: 16px;
-                            }
-
-                            TextEdit {
-                                vertical-stretch: 1;
-                                min-height: 60px;
-                                read-only: true;
-                                font-size: 11px;
-                                text: root.optimizer-log;
-                            }
+                        Text {
+                            color: #1f2937;
+                            text: "Iter/thread";
+                            vertical-alignment: center;
+                            font-size: 11px;
                         }
+                        LineEdit {
+                            min-width: 70px;
+                            max-width: 70px;
+                            enabled: !root.optimizer-running;
+                            text: "" + root.optimizer-iterations;
+                            edited(t) => { root.set-optimizer-iterations(t); }
+                        }
+                        Text {
+                            color: #1f2937;
+                            text: "Threads";
+                            vertical-alignment: center;
+                            font-size: 11px;
+                        }
+                        LineEdit {
+                            min-width: 50px;
+                            max-width: 50px;
+                            enabled: !root.optimizer-running;
+                            text: "" + root.optimizer-threads;
+                            edited(t) => { root.set-optimizer-threads(t); }
+                        }
+                        Text {
+                            color: #1f2937;
+                            text: "Top N";
+                            vertical-alignment: center;
+                            font-size: 11px;
+                        }
+                        LineEdit {
+                            min-width: 50px;
+                            max-width: 50px;
+                            enabled: !root.optimizer-running;
+                            text: "" + root.optimizer-top-solutions;
+                            edited(t) => { root.set-optimizer-top-solutions(t); }
+                        }
+
+                        // Распорка: прижимает поля влево, чтобы они не растягивались
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                    }
+
+                    HorizontalBox {
+                        spacing: 6px;
+                        padding: 0px;
+                        min-height: 34px;
+                        max-height: 34px;
+
+                        PrimaryActionButton {
+                            width: 160px;
+                            title: root.optimizer-running ? "Optimizing..." : "Optimize Layout";
+                            pressed => { if !root.optimizer-running { root.run-optimizer(); } }
+                        }
+                        Button {
+                            min-width: 80px;
+                            max-width: 80px;
+                            text: "Stop";
+                            enabled: root.optimizer-running;
+                            clicked => { root.stop-optimizer(); }
+                        }
+                        Button {
+                            min-width: 100px;
+                            max-width: 100px;
+                            text: "Apply best";
+                            clicked => { root.apply-optimizer-best(); }
+                        }
+
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                    }
+
+                    Text {
+                        text: root.optimizer-status;
+                        font-size: 11px;
+                        color: #475569;
+                        overflow: elide;
+                        min-height: 16px;
+                        max-height: 16px;
+                    }
+
+                    TextEdit {
+                        vertical-stretch: 1;
+                        min-height: 40px;
+                        read-only: true;
+                        font-size: 11px;
+                        text: root.optimizer-log;
                     }
                 }
             }

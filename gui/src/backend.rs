@@ -37,6 +37,10 @@ pub enum BackendCommand {
     RunCycleSimulation {
         settings: SimulationSettings,
     },
+    ToggleAnchor {
+        x: i32,
+        y: i32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +291,36 @@ fn run_backend(
                         "Redid map change".to_string()
                     } else {
                         "Nothing to redo".to_string()
+                    },
+                    None,
+                    changed,
+                )
+            }
+            BackendCommand::ToggleAnchor { x, y } => {
+                simulator.set_defer_path_calculation(true);
+                let previous = simulator.clone();
+                let result = simulator.toggle_anchor_at(x, y);
+                let changed = matches!(result, Ok(true));
+                if changed {
+                    history.record(previous);
+                }
+                (
+                    match result {
+                        Ok(true) => {
+                            let anchored = simulator
+                                .buildings()
+                                .iter()
+                                .find(|b| b.occupied_cells().any(|c| c == (x, y)))
+                                .map(|b| b.anchored)
+                                .unwrap_or(false);
+                            if anchored {
+                                format!("Anchored building at ({}, {})", x, y)
+                            } else {
+                                format!("Unanchored building at ({}, {})", x, y)
+                            }
+                        }
+                        Ok(false) => "No building at this cell".to_string(),
+                        Err(error) => format!("Anchor toggle failed: {}", error),
                     },
                     None,
                     changed,
