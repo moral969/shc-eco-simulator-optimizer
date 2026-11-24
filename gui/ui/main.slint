@@ -536,6 +536,19 @@ export component MainWindow inherits Window {
     in property <bool> popularity-good: true;
     in property <string> population-worker-summary: "";
     in property <string> population-economy-summary: "";
+    in-out property <int> optimizer-iterations: 500;
+    in-out property <int> optimizer-top-solutions: 5;
+    in property <bool> optimizer-running: false;
+    in property <string> optimizer-status: "";
+
+    callback run-optimizer();
+    callback set-optimizer-iterations(string);
+    callback set-optimizer-top-solutions(string);
+    callback set-optimizer-threads(string);
+    in-out property <int> optimizer-threads: 4;
+    in property <string> optimizer-log: "";
+    callback stop-optimizer();
+    callback apply-optimizer-best();
 
     callback place-at(float, float, bool);
     callback hover-at(float, float);
@@ -583,7 +596,7 @@ export component MainWindow inherits Window {
     private property <length> info-panel-width: 360px;
     private property <length> map-panel-width: 700px;
     private property <length> map-frame-width: root.map-panel-width - 20px;
-    private property <length> map-frame-height: 430px;
+    private property <length> map-frame-height: 300px;
     private property <length> workspace-top: 12px;
 
     init => { content-scope.focus(); }
@@ -860,6 +873,17 @@ export component MainWindow inherits Window {
                         selected(id) => { root.select-building(id); }
                     }
 
+                    ToolButton {
+                    title: "Anchor";
+                    tool-id: "anchor";
+                    selected-id: root.selected-building;
+                    map-color: #d946ef;
+                    show-color-mark: false;
+                    show-line-icon: false;
+                    use-icon: false;
+                    selected(id) => { root.select-building(id); }
+                }
+
                 }
             }
         }
@@ -949,7 +973,6 @@ export component MainWindow inherits Window {
                         root.remove-all();
                     }
                 }
-
                 Text {
                     x: parent.width - 170px;
                     y: 0px;
@@ -1444,9 +1467,75 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle {
-                        horizontal-stretch: 1;
                         vertical-stretch: 1;
-                        background: transparent;
+                        min-height: 150px;
+                        border-width: 1px;
+                        border-color: #d3d9e2;
+                        border-radius: 6px;
+                        background: #fbfcfe;
+
+                        VerticalBox {
+                            padding: 8px;
+                            spacing: 6px;
+
+                            HorizontalBox {
+                                spacing: 6px;
+                                min-height: 28px;
+                                max-height: 28px;
+
+                                Text { text: "Iter/thread"; vertical-alignment: center; font-size: 11px; }
+                                LineEdit {
+                                    width: 70px;
+                                    enabled: !root.optimizer-running;
+                                    text: "" + root.optimizer-iterations;
+                                    edited(t) => { root.set-optimizer-iterations(t); }
+                                }
+                                Text { text: "Threads"; vertical-alignment: center; font-size: 11px; }
+                                LineEdit {
+                                    width: 44px;
+                                    enabled: !root.optimizer-running;
+                                    text: "" + root.optimizer-threads;
+                                    edited(t) => { root.set-optimizer-threads(t); }
+                                }
+                                Text { text: "Top N"; vertical-alignment: center; font-size: 11px; }
+                                LineEdit {
+                                    width: 44px;
+                                    enabled: !root.optimizer-running;
+                                    text: "" + root.optimizer-top-solutions;
+                                    edited(t) => { root.set-optimizer-top-solutions(t); }
+                                }
+                            }
+
+                            HorizontalBox {
+                                spacing: 6px;
+                                min-height: 34px;
+                                max-height: 34px;
+
+                                PrimaryActionButton {
+                                    title: root.optimizer-running ? "Optimizing..." : "Optimize Layout";
+                                    pressed => { if !root.optimizer-running { root.run-optimizer(); } }
+                                }
+                                Button { text: "Stop"; enabled: root.optimizer-running; clicked => { root.stop-optimizer(); } }
+                                Button { text: "Apply best"; clicked => { root.apply-optimizer-best(); } }
+                            }
+
+                            Text {
+                                text: root.optimizer-status;
+                                font-size: 11px;
+                                color: #475569;
+                                overflow: elide;
+                                min-height: 16px;
+                                max-height: 16px;
+                            }
+
+                            TextEdit {
+                                vertical-stretch: 1;
+                                min-height: 60px;
+                                read-only: true;
+                                font-size: 11px;
+                                text: root.optimizer-log;
+                            }
+                        }
                     }
                 }
             }
