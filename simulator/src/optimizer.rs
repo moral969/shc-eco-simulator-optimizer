@@ -14,7 +14,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rand::{Rng, seq::IndexedRandom};
+use rand::{
+    Rng,
+    seq::{IndexedRandom, SliceRandom},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -24,6 +27,11 @@ use crate::{
 
 /// Отступ от края карты, при котором place_building/place_wall не расширяют карту.
 const MARGIN: i32 = 55;
+/// Сторона мастерской.
+const N: i32 = 4;
+/// Максимум мастерских в одном ряду под одной стеной.
+const MAX_ROW: usize = 8;
+const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
 
 #[derive(Debug, Clone)]
 pub struct OptimizerConfig {
@@ -34,6 +42,12 @@ pub struct OptimizerConfig {
     pub top_n: usize,
     /// Минимум отличающихся зданий, чтобы решения считались разными.
     pub min_diff: usize,
+    /// Максимум попыток стены в одном решении (одна попытка = одна стена любой длины,
+    /// которая разворачивает сразу ряд мастерских; снимать её необязательно). 0 — стены не используются.
+    pub max_walls: usize,
+    /// Штраф (gold/мин) за каждую использованную попытку стены: чем больше мастерских
+    /// разворачивается одной стеной, тем меньше штрафов и тем удобнее строить.
+    pub wall_penalty: f64,
     pub initial_temperature: f64,
     pub final_temperature: f64,
     pub output_dir: PathBuf,
@@ -49,11 +63,28 @@ impl Default for OptimizerConfig {
             threads,
             top_n: 5,
             min_diff: 2,
+            max_walls: 3,
+            wall_penalty: 3.0,
             initial_temperature: 30.0,
             final_temperature: 0.5,
             output_dir: PathBuf::from("optimizer_results"),
         }
     }
+}
+
+/// Стена, которой разворачивается целый ряд мастерских (общая для всех мастерских группы).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WallPlan {
+    /// Номер группы: мастерские с одним номером развёрнуты одной стеной.
+    pub group: u32,
+    /// "top"/"right"/"bottom"/"left" — с какой стороны вплотную стоит стена.
+    pub side: String,
+    pub sx: i32,
+    pub sy: i32,
+    pub ex: i32,
+    pub ey: i32,
+    /// true — стену после постройки не снимают.
+    pub kept: bool,
 }
 
 /// Шаг порядка построения.
@@ -62,14 +93,19 @@ pub struct PlanStep {
     pub building_type: BuildingType,
     pub x: i32,
     pub y: i32,
-    /// None — просто здание. Some("top"/"right"/"bottom"/"left") — сначала временная стена
-    /// с этой стороны вплотную, потом здание, потом стена снимается (вход остаётся повёрнутым).
-    pub temp_wall_side: Option<String>,
+    /// None — просто здание. Some — сначала стена (одна на всю группу), потом мастерские группы,
+    /// потом стена снимается, если не kept (вход остаётся повёрнутым).
+    pub wall: Option<WallPlan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptimizationResult {
+    /// Чистое золото/мин.
     pub gold_per_minute: f64,
+    /// Оценка отжига: золото минус штраф за попытки стен (по ней сортируется архив).
+    pub score: f64,
+    /// Сколько попыток стены использовано в решении.
+    pub walls_used: usize,
     pub worker: usize,
     pub iteration: usize,
     /// Порядок, в котором выжившие здания были поставлены в последний раз.
@@ -142,10 +178,11 @@ impl Archive {
         } else {
             self.entries
                 .last()
-                .map_or(f64::NEG_INFINITY, |e| e.result.gold_per_minute)
+                .map_or(f64::NEG_INFINITY, |e| e.result.score)
         }
     }
 
+    /// Чистое золото лучшего решения (по score) и поток, который его нашёл.
     fn best(&self) -> Option<(f64, usize)> {
         self.entries
             .first()
@@ -153,7 +190,7 @@ impl Archive {
     }
 
     fn offer(&mut self, entry: Entry) {
-        let score = entry.result.gold_per_minute;
+        let score = entry.result.score;
         if score <= self.threshold() {
             return;
         }
@@ -162,7 +199,7 @@ impl Archive {
             .iter()
             .position(|e| entry.keys.difference(&e.keys).count() < self.min_diff);
         match similar {
-            Some(pos) if score > self.entries[pos].result.gold_per_minute => {
+            Some(pos) if score > self.entries[pos].result.score => {
                 self.entries[pos] = entry;
             }
             Some(_) => return,
@@ -170,8 +207,8 @@ impl Archive {
         }
         self.entries.sort_by(|a, b| {
             b.result
-                .gold_per_minute
-                .partial_cmp(&a.result.gold_per_minute)
+                .score
+                .partial_cmp(&a.result.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         self.entries.truncate(self.top_n);
@@ -190,7 +227,17 @@ struct Shared {
 }
 
 impl Shared {
-    fn offer(&self, worker: usize, iteration: usize, score: f64, sim: &Simulator, plan: &[PlanStep]) {
+    #[allow(clippy::too_many_arguments)]
+    fn offer(
+        &self,
+        worker: usize,
+        iteration: usize,
+        gold: f64,
+        score: f64,
+        walls_used: usize,
+        sim: &Simulator,
+        plan: &[PlanStep],
+    ) {
         {
             let a = self.archive.lock().unwrap_or_else(|e| e.into_inner());
             if score <= a.threshold() {
@@ -200,10 +247,12 @@ impl Shared {
         let entry = Entry {
             keys: layout_keys(sim),
             result: OptimizationResult {
-                gold_per_minute: score,
+                gold_per_minute: gold,
+                score,
+                walls_used,
                 worker,
                 iteration,
-                build_order: plan.to_vec(),
+                build_order: normalize_plan(plan),
                 project: ProjectFile::capture(sim, self.settings, self.population),
             },
         };
@@ -228,6 +277,69 @@ fn layout_keys(sim: &Simulator) -> HashSet<String> {
             )
         })
         .collect()
+}
+
+/// Для снимаемых стен укорачивает линию до реально оставшихся мастерских группы
+/// (часть мастерских могла быть переставлена позже). Оставленные стены не трогает.
+fn normalize_plan(plan: &[PlanStep]) -> Vec<PlanStep> {
+    let mut out = plan.to_vec();
+    let groups: HashSet<u32> = removed_groups(plan.iter());
+    for group in groups {
+        let idx: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.wall.as_ref().is_some_and(|w| w.group == group))
+            .map(|(i, _)| i)
+            .collect();
+        let Some(&first) = idx.first() else { continue };
+        let Some(wall) = out[first].wall.clone() else { continue };
+        let horizontal = wall.side == "top" || wall.side == "bottom";
+        let (lo, hi) = idx.iter().fold((i32::MAX, i32::MIN), |(lo, hi), &i| {
+            let v = if horizontal { out[i].x } else { out[i].y };
+            (lo.min(v), hi.max(v))
+        });
+        for &i in &idx {
+            if let Some(w) = out[i].wall.as_mut() {
+                if horizontal {
+                    w.sx = lo;
+                    w.ex = hi + N - 1;
+                } else {
+                    w.sy = lo;
+                    w.ey = hi + N - 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------- walls budget
+
+#[derive(Debug, Clone, Copy)]
+struct WallBudget {
+    /// Максимум попыток стены.
+    max: usize,
+    /// Сколько стен было в исходной раскладке (их не считаем).
+    base: usize,
+}
+
+/// Номера групп со снимаемой стеной (оставленные стены считаются по самому симулятору).
+fn removed_groups<'a>(steps: impl Iterator<Item = &'a PlanStep>) -> HashSet<u32> {
+    steps
+        .filter_map(|s| s.wall.as_ref().filter(|w| !w.kept).map(|w| w.group))
+        .collect()
+}
+
+/// Сколько попыток стены использовано: оставленные стены (лишние в симуляторе)
+/// плюс группы со снятой стеной, у которых ещё есть мастерские в плане.
+fn wall_attempts(sim: &Simulator, plan: &[PlanStep], base: usize) -> usize {
+    sim.walls().len().saturating_sub(base) + removed_groups(plan.iter()).len()
+}
+
+/// Оценка отжига: золото минус штраф за использованные попытки стен.
+fn energy(gold: f64, sim: &Simulator, plan: &[PlanStep], budget: WallBudget, penalty: f64) -> (f64, usize) {
+    let used = wall_attempts(sim, plan, budget.base);
+    (gold - penalty * used as f64, used)
 }
 
 // ---------------------------------------------------------------- evaluation
@@ -355,15 +467,18 @@ fn mutate(
     base: &Simulator,
     rng: &mut impl Rng,
     progress: f64,
+    plan: &[PlanStep],
+    budget: WallBudget,
 ) -> Option<(Simulator, Vec<Change>)> {
     let mut sim = base.clone();
     sim.set_defer_path_calculation(true);
     let mut changes = Vec::new();
     let roll = rng.random_range(0..100);
-    let done = if roll < 45 {
+    // При max == 0 долю стен отдаём перемещениям, чтобы не гонять пустые итерации.
+    let done = if roll < 45 || (budget.max == 0 && roll < 80) {
         relocate(&mut sim, rng, progress, &mut changes)
     } else if roll < 80 {
-        wall_trick(&mut sim, rng, progress, &mut changes)
+        wall_row(&mut sim, rng, progress, plan, budget, &mut changes)
     } else {
         swap(&mut sim, rng, &mut changes)
     };
@@ -434,7 +549,7 @@ fn relocate(
                 building_type: t,
                 x,
                 y,
-                temp_wall_side: None,
+                wall: None,
             }));
             return Some(());
         }
@@ -442,64 +557,161 @@ fn relocate(
     None
 }
 
-/// Стена вплотную к стороне -> мастерская -> стена убирается. Вход остаётся повёрнутым.
+/// Прямоугольник w x h свободен и целиком внутри карты.
+fn area_free(sim: &Simulator, x: i32, y: i32, w: i32, h: i32) -> bool {
+    let bounds = sim.map_bounds();
+    (x..x + w).all(|cx| {
+        (y..y + h).all(|cy| bounds.contains(cx, cy) && !sim.is_cell_occupied(cx, cy))
+    })
+}
+
+/// Одна стена вплотную к ряду мастерских (все стоят впритык друг к другу) -> мастерские ставятся ->
+/// стена убирается (или остаётся). Все мастерские ряда получают повёрнутый вход от одной стены.
 /// Стороны соответствуют workshop_wall_rotation_steps: top->0, right->1, bottom->2, left->3.
-fn wall_trick(
+/// Создание стены = 1 попытка, независимо от длины и числа мастерских.
+fn wall_row(
     sim: &mut Simulator,
     rng: &mut impl Rng,
     progress: f64,
+    plan: &[PlanStep],
+    budget: WallBudget,
     changes: &mut Vec<Change>,
 ) -> Option<()> {
-    let list: Vec<_> = movable(sim)
+    let workshops: Vec<_> = movable(sim)
         .into_iter()
         .filter(|m| is_workshop(m.1))
         .collect();
-    let &(id, t, ox, oy) = list.choose(rng)?;
-    let (around, radius) = pick_target(sim, rng, id, (ox, oy), progress)?;
-    let same_place = rng.random_bool(0.4);
-    if !sim.remove_building(id) {
+    if workshops.is_empty() {
         return None;
     }
-    changes.push(Change::Removed { x: ox, y: oy });
 
-    const N: i32 = 4;
-    const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
+    // Какие мастерские разворачиваем одной стеной.
+    let mut chosen: Vec<(u32, BuildingType, i32, i32)> = Vec::new();
+    let groups: Vec<u32> = removed_groups(plan.iter()).into_iter().collect();
+    if !groups.is_empty() && rng.random_bool(0.5) {
+        // Переукладываем существующий ряд целиком и пробуем нарастить его.
+        let g = *groups.choose(rng)?;
+        for w in &workshops {
+            let in_group = plan
+                .iter()
+                .any(|s| (s.x, s.y) == (w.2, w.3) && s.wall.as_ref().is_some_and(|p| p.group == g));
+            if in_group {
+                chosen.push(*w);
+            }
+        }
+        for _ in 0..rng.random_range(0..=2) {
+            if chosen.len() >= MAX_ROW {
+                break;
+            }
+            if let Some(w) = workshops.choose(rng) {
+                if !chosen.iter().any(|c| c.0 == w.0) {
+                    chosen.push(*w);
+                }
+            }
+        }
+    } else {
+        // Новый ряд: размер смещён в сторону больших рядов.
+        let cap = workshops.len().min(MAX_ROW);
+        let k = rng.random_range(1..=cap).max(rng.random_range(1..=cap));
+        let mut pool = workshops.clone();
+        pool.shuffle(rng);
+        chosen = pool.into_iter().take(k).collect();
+    }
+    if chosen.is_empty() {
+        return None;
+    }
+    chosen.shuffle(rng);
+
+    // Бюджет попыток: оставленные стены + группы со снятой стеной, которые останутся
+    // после переукладки выбранных мастерских, + одна новая.
+    let chosen_pos: HashSet<(i32, i32)> = chosen.iter().map(|c| (c.2, c.3)).collect();
+    let kept_extra = sim.walls().len().saturating_sub(budget.base);
+    let remaining =
+        removed_groups(plan.iter().filter(|s| !chosen_pos.contains(&(s.x, s.y)))).len();
+    if kept_extra + remaining + 1 > budget.max {
+        return None;
+    }
+    let group = plan
+        .iter()
+        .filter_map(|s| s.wall.as_ref().map(|w| w.group))
+        .max()
+        .map_or(1, |g| g + 1);
+
+    let first = chosen[0];
+    let (around, radius) = pick_target(sim, rng, first.0, (first.2, first.3), progress)?;
+    for c in &chosen {
+        if !sim.remove_building(c.0) {
+            return None;
+        }
+        changes.push(Change::Removed { x: c.2, y: c.3 });
+    }
+
+    let k = chosen.len() as i32;
     for _ in 0..30 {
-        let (x, y) = if same_place {
-            (ox, oy)
-        } else {
-            pick_position(sim, rng, t, around, radius)?
-        };
+        let (x, y) = pick_position(sim, rng, first.1, around, radius)?;
         let rot = rng.random_range(0..4usize);
+        // Ряд лежит вдоль стены: top/bottom — горизонтально, right/left — вертикально.
+        let (w, h) = if rot % 2 == 0 { (N * k, N) } else { (N, N * k) };
         let (sx, sy, ex, ey) = match rot {
-            0 => (x, y + N, x + N - 1, y + N),
-            1 => (x + N, y, x + N, y + N - 1),
-            2 => (x, y - 1, x + N - 1, y - 1),
-            _ => (x - 1, y, x - 1, y + N - 1),
+            0 => (x, y + N, x + w - 1, y + N),
+            1 => (x + N, y, x + N, y + h - 1),
+            2 => (x, y - 1, x + w - 1, y - 1),
+            _ => (x - 1, y, x - 1, y + h - 1),
         };
         let bounds = sim.map_bounds();
-        let side_free = line_cells(sx, sy, ex, ey)
-            .iter()
-            .all(|&(cx, cy)| bounds.contains(cx, cy) && !sim.is_cell_occupied(cx, cy));
-        if !side_free {
+        let (lo_x, hi_x) = (x.min(sx), (x + w).max(ex + 1));
+        let (lo_y, hi_y) = (y.min(sy), (y + h).max(ey + 1));
+        if lo_x < bounds.min_x + MARGIN
+            || hi_x > bounds.max_x - MARGIN
+            || lo_y < bounds.min_y + MARGIN
+            || hi_y > bounds.max_y - MARGIN
+        {
             continue;
         }
+        let slots: Vec<(i32, i32)> = (0..k)
+            .map(|i| if rot % 2 == 0 { (x + N * i, y) } else { (x, y + N * i) })
+            .collect();
+        let wall_free = line_cells(sx, sy, ex, ey)
+            .iter()
+            .all(|&(cx, cy)| !sim.is_cell_occupied(cx, cy));
+        if !wall_free || !slots.iter().all(|&(px, py)| area_free(sim, px, py, N, N)) {
+            continue;
+        }
+
         let mut trial = sim.clone();
         if trial.place_wall(sx, sy, ex, ey).is_err() {
             continue;
         }
-        if trial.place_building(t, x, y).is_err() {
+        if !chosen
+            .iter()
+            .zip(&slots)
+            .all(|(c, &(px, py))| trial.place_building(c.1, px, py).is_ok())
+        {
             continue;
         }
-        // клетки были свободны, поэтому последняя стена в этой клетке — наша
-        trial.remove_whole_wall_at(sx, sy);
+        // Часть стен оставляем: снимать её необязательно.
+        let kept = rng.random_bool(0.2);
+        if !kept {
+            // клетки были свободны, поэтому последняя стена в этой клетке — наша
+            trial.remove_whole_wall_at(sx, sy);
+        }
         *sim = trial;
-        changes.push(Change::Placed(PlanStep {
-            building_type: t,
-            x,
-            y,
-            temp_wall_side: Some(SIDES[rot].to_string()),
-        }));
+        for (c, &(px, py)) in chosen.iter().zip(&slots) {
+            changes.push(Change::Placed(PlanStep {
+                building_type: c.1,
+                x: px,
+                y: py,
+                wall: Some(WallPlan {
+                    group,
+                    side: SIDES[rot].to_string(),
+                    sx,
+                    sy,
+                    ex,
+                    ey,
+                    kept,
+                }),
+            }));
+        }
         return Some(());
     }
     None
@@ -528,7 +740,7 @@ fn swap(sim: &mut Simulator, rng: &mut impl Rng, changes: &mut Vec<Change>) -> O
             building_type: t,
             x,
             y,
-            temp_wall_side: None,
+            wall: None,
         }));
     }
     Some(())
@@ -542,6 +754,11 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
     let iters = sh.cfg.max_iterations.max(1);
     let t0 = sh.cfg.initial_temperature.max(1e-6);
     let t1 = sh.cfg.final_temperature.max(1e-6).min(t0);
+    let penalty = sh.cfg.wall_penalty.max(0.0);
+    let budget = WallBudget {
+        max: sh.cfg.max_walls,
+        base: start.walls().len(),
+    };
 
     let mut cur = start;
     cur.set_defer_path_calculation(true);
@@ -551,7 +768,7 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
             building_type: t,
             x,
             y,
-            temp_wall_side: None,
+            wall: None,
         })
         .collect();
 
@@ -561,18 +778,19 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
             if sh.cancel.load(Ordering::Relaxed) {
                 return;
             }
-            if let Some((s, ch)) = mutate(&cur, &mut rng, 0.0) {
+            if let Some((s, ch)) = mutate(&cur, &mut rng, 0.0, &plan, budget) {
                 cur = s;
                 apply_changes(&mut plan, ch);
             }
         }
     }
 
-    let mut cur_score = evaluate(&mut cur, settings);
+    let gold = evaluate(&mut cur, settings);
+    let (mut cur_score, used) = energy(gold, &cur, &plan, budget, penalty);
     sh.evaluated.fetch_add(1, Ordering::Relaxed);
     let mut best_score = cur_score;
     let mut best = (cur.clone(), plan.clone());
-    sh.offer(id, 0, best_score, &best.0, &best.1);
+    sh.offer(id, 0, gold, best_score, used, &best.0, &best.1);
 
     let patience = (iters / 8).max(300);
     let mut last_improve = 0usize;
@@ -584,19 +802,22 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
         let progress = i as f64 / iters as f64;
         let temp = t0 * (t1 / t0).powf(progress);
 
-        if let Some((mut cand, changes)) = mutate(&cur, &mut rng, progress) {
-            let score = evaluate(&mut cand, settings);
+        if let Some((mut cand, changes)) = mutate(&cur, &mut rng, progress, &plan, budget) {
+            let gold = evaluate(&mut cand, settings);
+            let mut cand_plan = plan.clone();
+            apply_changes(&mut cand_plan, changes);
+            let (score, used) = energy(gold, &cand, &cand_plan, budget, penalty);
             sh.evaluated.fetch_add(1, Ordering::Relaxed);
             let delta = score - cur_score;
             if delta >= 0.0 || rng.random::<f64>() < (delta / temp).exp() {
                 cur = cand;
+                plan = cand_plan;
                 cur_score = score;
-                apply_changes(&mut plan, changes);
                 if score > best_score + 1e-9 {
                     best_score = score;
                     best = (cur.clone(), plan.clone());
                     last_improve = i;
-                    sh.offer(id, i, score, &best.0, &best.1);
+                    sh.offer(id, i, gold, score, used, &best.0, &best.1);
                 }
             }
         }
@@ -644,11 +865,12 @@ fn coordinator(
     let threads = cfg.threads.max(1);
     let total_iterations = (threads * cfg.max_iterations.max(1)) as f64;
     send(OptimizerEvent::Log(format!(
-        "Старт: {} потоков x {} итераций, подвижных зданий: {}, top {}",
+        "Старт: {} потоков x {} итераций, подвижных зданий: {}, top {}, попыток стены: {}",
         threads,
         cfg.max_iterations,
         movable(&layout).len(),
-        cfg.top_n
+        cfg.top_n,
+        cfg.max_walls
     )));
 
     let shared = Arc::new(Shared {
