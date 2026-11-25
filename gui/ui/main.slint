@@ -579,6 +579,11 @@ export component MainWindow inherits Window {
     in-out property <int> optimizer-threads: 4;
     callback set-optimizer-max-walls(string);
     in-out property <int> optimizer-max-walls: 3;
+    in property <bool> timeline-active: false;
+    in property <int> timeline-count: 0;
+    in-out property <float> timeline-position: 0;
+    in property <string> timeline-label: "";
+    callback timeline-seek(float);
     private property <string> optimizer-hint: "";
     in property <string> optimizer-log: "";
     callback stop-optimizer();
@@ -631,6 +636,7 @@ export component MainWindow inherits Window {
     private property <length> map-panel-width: max(1px, root.width - root.assets-panel-width - root.info-panel-width - root.outer-padding * 2 - root.panel-gap * 2);
     private property <length> simulation-block-height: 340px;
     private property <length> optimizer-block-height: 190px;
+    private property <length> timeline-block-height: 60px;
     private property <length> workspace-top: 12px;
 
     // Высота карты, которую задаёт пользователь (тянется за разделитель).
@@ -638,7 +644,7 @@ export component MainWindow inherits Window {
     // Всё, что занимает место кроме карты: отступы окна и панели, toolbar, разделитель, блоки, spacing.
     // Высота всего содержимого центральной панели: карта + toolbar + разделитель + блоки
     // + отступы панели (20px) и spacing (4 x 8px). Если больше окна — появляется прокрутка.
-    private property <length> map-content-height: root.map-effective-height + 42px + 6px + root.simulation-block-height + root.optimizer-block-height + 52px;
+    private property <length> map-content-height: root.map-effective-height + 42px + 6px + root.simulation-block-height + root.optimizer-block-height + root.timeline-block-height + 60px;
     // Карту можно растягивать вниз сколько угодно, лишнее уходит в прокрутку.
     private property <length> map-max-height: 4000px;
     // Фактическая высота карты: не меньше 120px и не больше, чем влезает в окно.
@@ -1373,6 +1379,76 @@ export component MainWindow inherits Window {
                                 min(root.map-max-height, root.map-effective-height + (self.mouse-y - self.press-y)),
                             );
                         }
+                    }
+                }
+            }
+
+            // --- Timeline: порядок строительства (активен, если в проекте есть последовательность) ---
+            Rectangle {
+                min-height: root.timeline-block-height;
+                max-height: root.timeline-block-height;
+                border-width: 1px;
+                border-color: #d3d9e2;
+                border-radius: 6px;
+                background: #fbfcfe;
+                opacity: root.timeline-active ? 1 : 0.5;
+                clip: true;
+
+                VerticalBox {
+                    padding: 6px;
+                    spacing: 4px;
+
+                    HorizontalBox {
+                        padding: 0px;
+                        spacing: 6px;
+                        min-height: 24px;
+                        max-height: 24px;
+
+                        Button {
+                            min-width: 36px;
+                            max-width: 36px;
+                            text: "|<";
+                            enabled: root.timeline-active;
+                            clicked => { root.timeline-seek(0); }
+                        }
+                        Button {
+                            min-width: 36px;
+                            max-width: 36px;
+                            text: "<";
+                            enabled: root.timeline-active;
+                            clicked => { root.timeline-seek(max(0, root.timeline-position - 1)); }
+                        }
+                        Slider {
+                            horizontal-stretch: 1;
+                            enabled: root.timeline-active;
+                            minimum: 0;
+                            maximum: max(1, root.timeline-count);
+                            value <=> root.timeline-position;
+                            changed(value) => { root.timeline-seek(value); }
+                        }
+                        Button {
+                            min-width: 36px;
+                            max-width: 36px;
+                            text: ">";
+                            enabled: root.timeline-active;
+                            clicked => { root.timeline-seek(min(root.timeline-count, root.timeline-position + 1)); }
+                        }
+                        Button {
+                            min-width: 36px;
+                            max-width: 36px;
+                            text: ">|";
+                            enabled: root.timeline-active;
+                            clicked => { root.timeline-seek(root.timeline-count); }
+                        }
+                    }
+
+                    Text {
+                        text: root.timeline-label;
+                        font-size: 11px;
+                        color: #475569;
+                        overflow: elide;
+                        min-height: 16px;
+                        max-height: 16px;
                     }
                 }
             }

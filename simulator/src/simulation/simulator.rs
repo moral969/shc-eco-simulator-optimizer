@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     SavedBuilding,
+    build_log::BuildStep,
     buildings::{BuildingFactory, BuildingPlacement, BuildingType, StockpileResource},
     map::{CellMap, MapBounds, MapError},
     project::validate_unique_ids,
@@ -38,6 +39,10 @@ pub struct Simulator {
     defer_path_calculation: bool,
     next_wheat_layout: u8,
     bread_capacities: RefCell<Option<(i32, super::bread::BreadCapacities)>>,
+    /// Последовательность действий, которыми построена текущая расстановка.
+    build_log: Vec<BuildStep>,
+    /// false — журнал не пишется (оптимизатор или загруженный проект без последовательности).
+    record_build_log: bool,
 }
 
 #[derive(Debug)]
@@ -151,6 +156,8 @@ impl Simulator {
             defer_path_calculation: false,
             next_wheat_layout: 0,
             bread_capacities: RefCell::new(None),
+            build_log: Vec::new(),
+            record_build_log: true,
         })
     }
 
@@ -223,6 +230,9 @@ impl Simulator {
             map.place_wall_cells(wall.cells())?;
         }
 
+        // Для непустой раскладки без известной последовательности журнал вести нельзя:
+        // он не был бы полным. Его включит set_build_log или remove_all.
+        let empty_layout = buildings.is_empty() && walls.is_empty();
         let mut simulator = Self {
             map,
             factory: BuildingFactory::with_next_ids(next_building_id, next_group_id),
@@ -235,6 +245,8 @@ impl Simulator {
             distances: HashMap::new(),
             worker_distances: HashMap::new(),
             defer_path_calculation: false,
+            build_log: Vec::new(),
+            record_build_log: empty_layout,
         };
         simulator.refresh_unavailable_entry_points();
         simulator.recompute_distances();
@@ -329,6 +341,7 @@ impl Simulator {
         )?;
         let id = candidate.place_building_in_bounds(building_type, x, y)?;
         *self = candidate;
+        self.record_step(BuildStep::Building { building_type, x, y });
         Ok(id)
     }
 
@@ -386,6 +399,12 @@ impl Simulator {
         )?;
         let id = candidate.place_wall_in_bounds(start_x, start_y, end_x, end_y)?;
         *self = candidate;
+        self.record_step(BuildStep::Wall {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        });
         Ok(id)
     }
 
@@ -412,11 +431,11 @@ impl Simulator {
     }
 
     pub fn remove_building(&mut self, building_id: u32) -> bool {
-        let Some(goods_yard_group_id) = self
+        let Some((goods_yard_group_id, x, y)) = self
             .buildings
             .iter()
             .find(|building| building.id == building_id)
-            .map(|building| building.goods_yard_group_id)
+            .map(|building| (building.goods_yard_group_id, building.x, building.y))
         else {
             return false;
         };
@@ -427,15 +446,39 @@ impl Simulator {
             self.remove_buildings_by_ids([building_id])
         };
 
-        !removed.is_empty()
+        if removed.is_empty() {
+            return false;
+        }
+        self.record_step(BuildStep::Remove {
+            x,
+            y,
+            whole_wall: false,
+        });
+        true
     }
 
     pub fn remove_at(&mut self, x: i32, y: i32) -> RemoveOutcome {
-        self.remove_at_with_wall_behavior(x, y, false)
+        let outcome = self.remove_at_with_wall_behavior(x, y, false);
+        if outcome != RemoveOutcome::None {
+            self.record_step(BuildStep::Remove {
+                x,
+                y,
+                whole_wall: false,
+            });
+        }
+        outcome
     }
 
     pub fn remove_whole_wall_at(&mut self, x: i32, y: i32) -> RemoveOutcome {
-        self.remove_at_with_wall_behavior(x, y, true)
+        let outcome = self.remove_at_with_wall_behavior(x, y, true);
+        if outcome != RemoveOutcome::None {
+            self.record_step(BuildStep::Remove {
+                x,
+                y,
+                whole_wall: true,
+            });
+        }
+        outcome
     }
 
     fn remove_at_with_wall_behavior(
@@ -492,6 +535,7 @@ impl Simulator {
 
         self.refresh_unavailable_entry_points();
         self.recompute_distances();
+        self.record_step(BuildStep::RemoveAllWalls);
         count
     }
 
@@ -510,6 +554,10 @@ impl Simulator {
         self.worker_distances.clear();
 
         self.bread_capacities.get_mut().take();
+
+        // Пустая карта: журнал снова полный, запись возобновляется.
+        self.build_log.clear();
+        self.record_build_log = true;
 
         (building_count, wall_count)
     }
@@ -688,6 +736,7 @@ impl Simulator {
             .expect("target stockpile should still exist");
         target.stockpile_resource = Some(resource);
         self.recompute_worker_distances();
+        self.record_step(BuildStep::Stockpile { x, y, resource });
 
         Ok(target_id)
     }
@@ -707,6 +756,74 @@ impl Simulator {
     /// Returns true if any building is anchored.
     pub fn has_anchors(&self) -> bool {
         self.buildings.iter().any(|b| b.anchored)
+    }
+
+    /// Последовательность действий, которыми построена текущая расстановка.
+    pub fn build_log(&self) -> &[BuildStep] {
+        &self.build_log
+    }
+
+    /// Подменяет журнал (загрузка проекта) и включает запись дальше.
+    pub fn set_build_log(&mut self, steps: Vec<BuildStep>) {
+        self.build_log = steps;
+        self.record_build_log = true;
+    }
+
+    /// Выключает и очищает журнал (оптимизатор клонирует симулятор тысячи раз).
+    pub fn disable_build_log(&mut self) {
+        self.build_log.clear();
+        self.record_build_log = false;
+    }
+
+    fn record_step(&mut self, step: BuildStep) {
+        if self.record_build_log {
+            self.build_log.push(step);
+        }
+    }
+
+    /// Применяет один шаг журнала; ошибки игнорируются (шаг мог устареть).
+    pub fn apply_build_step(&mut self, step: &BuildStep) {
+        match step {
+            BuildStep::Building { building_type, x, y } => {
+                let _ = self.place_building(*building_type, *x, *y);
+            }
+            BuildStep::Wall {
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+            } => {
+                let _ = self.place_wall(*start_x, *start_y, *end_x, *end_y);
+            }
+            BuildStep::Remove {
+                x,
+                y,
+                whole_wall: true,
+            } => {
+                self.remove_whole_wall_at(*x, *y);
+            }
+            BuildStep::Remove { x, y, .. } => {
+                self.remove_at(*x, *y);
+            }
+            BuildStep::RemoveAllWalls => {
+                self.remove_all_walls();
+            }
+            BuildStep::Stockpile { x, y, resource } => {
+                let _ = self.set_stockpile_resource_at(*x, *y, *resource);
+            }
+        }
+    }
+
+    /// Строит расстановку заново из первых `steps` шагов журнала (на тех же границах карты).
+    /// Расстояния не считаются, это только для показа на карте.
+    pub fn replay_build_log(&self, steps: usize) -> Option<Simulator> {
+        let mut replay = Simulator::with_bounds(self.map_bounds()).ok()?;
+        replay.record_build_log = false;
+        replay.set_defer_path_calculation(true);
+        for step in self.build_log.iter().take(steps) {
+            replay.apply_build_step(step);
+        }
+        Some(replay)
     }
 
     fn assign_entry_points(&self, placement: &mut BuildingPlacement) {

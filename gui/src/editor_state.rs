@@ -30,6 +30,9 @@ pub struct EditorState {
     population_economy_settings: PopulationEconomySettings,
     cycle_rows: Vec<CycleSimulationRow>,
     simulation_results_stale: bool,
+    /// Шаг таймлайна: 0..=длина журнала. Равен длине — показывается настоящая раскладка.
+    timeline_position: usize,
+    timeline_preview: Option<Simulator>,
 }
 
 impl EditorState {
@@ -44,6 +47,8 @@ impl EditorState {
             population_economy_settings: PopulationEconomySettings::default(),
             cycle_rows: Vec::new(),
             simulation_results_stale: true,
+            timeline_position: 0,
+            timeline_preview: None,
         })
     }
 
@@ -56,7 +61,58 @@ impl EditorState {
     }
 
     pub fn set_simulator(&mut self, simulator: Simulator) {
+        // Любое изменение от бэкенда возвращает таймлайн на последний шаг.
+        self.timeline_position = simulator.build_log().len();
+        self.timeline_preview = None;
         self.simulator = simulator;
+    }
+
+    /// Что рисовать на карте: проигранный до выбранного шага симулятор или настоящий.
+    pub fn view_simulator(&self) -> &Simulator {
+        self.timeline_preview.as_ref().unwrap_or(&self.simulator)
+    }
+
+    pub fn timeline_len(&self) -> usize {
+        self.simulator.build_log().len()
+    }
+
+    pub fn timeline_position(&self) -> usize {
+        self.timeline_position
+    }
+
+    pub fn timeline_previewing(&self) -> bool {
+        self.timeline_preview.is_some()
+    }
+
+    pub fn set_timeline_position(&mut self, position: usize) {
+        let len = self.timeline_len();
+        let position = position.min(len);
+        if position == self.timeline_position {
+            return;
+        }
+        self.timeline_position = position;
+        self.timeline_preview = if position >= len {
+            None
+        } else {
+            self.simulator.replay_build_log(position)
+        };
+    }
+
+    pub fn timeline_label(&self) -> String {
+        let len = self.timeline_len();
+        if len == 0 {
+            return "No build order recorded for this layout".to_string();
+        }
+        let position = self.timeline_position;
+        if position == 0 {
+            return format!("Step 0 / {}: empty map", len);
+        }
+        format!(
+            "Step {} / {}: {}",
+            position,
+            len,
+            self.simulator.build_log()[position - 1].describe()
+        )
     }
 
     pub fn set_cycle_rows(&mut self, cycle_rows: Vec<CycleSimulationRow>) {

@@ -21,7 +21,7 @@ use rand::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BuildingType, Footprint, PopulationEconomySettings, ProjectFile, SimulationSettings,
+    BuildStep, BuildingType, Footprint, PopulationEconomySettings, ProjectFile, SimulationSettings,
     Simulator, StockpileResource, walls::line_cells,
 };
 
@@ -224,6 +224,8 @@ struct Shared {
     archive: Mutex<Archive>,
     evaluated: AtomicU64,
     iterations: AtomicU64,
+    /// Неподвижная часть раскладки: с неё начинается таймлайн.
+    fixed_steps: Vec<BuildStep>,
 }
 
 impl Shared {
@@ -244,6 +246,14 @@ impl Shared {
                 return;
             }
         }
+        let build_order = normalize_plan(plan);
+        let mut project = ProjectFile::capture(sim, self.settings, self.population);
+        project.build_sequence = self
+            .fixed_steps
+            .iter()
+            .cloned()
+            .chain(plan_steps(&build_order))
+            .collect();
         let entry = Entry {
             keys: layout_keys(sim),
             result: OptimizationResult {
@@ -252,8 +262,8 @@ impl Shared {
                 walls_used,
                 worker,
                 iteration,
-                build_order: normalize_plan(plan),
-                project: ProjectFile::capture(sim, self.settings, self.population),
+                build_order,
+                project,
             },
         };
         self.archive
@@ -308,6 +318,96 @@ fn normalize_plan(plan: &[PlanStep]) -> Vec<PlanStep> {
                     w.ey = hi + N - 1;
                 }
             }
+        }
+    }
+    out
+}
+
+/// Неподвижная часть исходной раскладки в порядке построения:
+/// стены, склады/заякоренные здания, назначения складов.
+fn fixed_steps(layout: &Simulator) -> Vec<BuildStep> {
+    let mut steps: Vec<BuildStep> = layout
+        .walls()
+        .iter()
+        .map(|w| BuildStep::Wall {
+            start_x: w.start_x,
+            start_y: w.start_y,
+            end_x: w.end_x,
+            end_y: w.end_y,
+        })
+        .collect();
+    let free: HashSet<u32> = movable(layout).iter().map(|m| m.0).collect();
+    // Goods Yard состоит из 4 стеков: ставим один раз, по левому нижнему углу группы.
+    let mut yards: Vec<(u32, i32, i32)> = Vec::new();
+    for b in layout.buildings().iter().filter(|b| !free.contains(&b.id)) {
+        match b.goods_yard_group_id {
+            Some(group) => match yards.iter_mut().find(|y| y.0 == group) {
+                Some(y) => {
+                    y.1 = y.1.min(b.x);
+                    y.2 = y.2.min(b.y);
+                }
+                None => yards.push((group, b.x, b.y)),
+            },
+            None => steps.push(BuildStep::Building {
+                building_type: b.building_type,
+                x: b.x,
+                y: b.y,
+            }),
+        }
+    }
+    steps.extend(yards.into_iter().map(|(_, x, y)| BuildStep::Building {
+        building_type: BuildingType::GoodsYard,
+        x,
+        y,
+    }));
+    for b in layout.buildings() {
+        if let Some(resource) = b.stockpile_resource {
+            steps.push(BuildStep::Stockpile {
+                x: b.x,
+                y: b.y,
+                resource,
+            });
+        }
+    }
+    steps
+}
+
+/// План оптимизатора -> шаги: у ряда под одной стеной сначала стена, потом все мастерские ряда,
+/// потом снятие стены (если не kept).
+fn plan_steps(plan: &[PlanStep]) -> Vec<BuildStep> {
+    let building = |s: &PlanStep| BuildStep::Building {
+        building_type: s.building_type,
+        x: s.x,
+        y: s.y,
+    };
+    let mut out = Vec::new();
+    let mut handled = HashSet::new();
+    for (i, step) in plan.iter().enumerate() {
+        let Some(wall) = &step.wall else {
+            out.push(building(step));
+            continue;
+        };
+        if !handled.insert(wall.group) {
+            continue;
+        }
+        out.push(BuildStep::Wall {
+            start_x: wall.sx,
+            start_y: wall.sy,
+            end_x: wall.ex,
+            end_y: wall.ey,
+        });
+        out.extend(
+            plan[i..]
+                .iter()
+                .filter(|s| s.wall.as_ref().is_some_and(|w| w.group == wall.group))
+                .map(building),
+        );
+        if !wall.kept {
+            out.push(BuildStep::Remove {
+                x: wall.sx,
+                y: wall.sy,
+                whole_wall: true,
+            });
         }
     }
     out
@@ -762,6 +862,8 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
 
     let mut cur = start;
     cur.set_defer_path_calculation(true);
+    cur.disable_build_log();
+
     let mut plan: Vec<PlanStep> = movable(&cur)
         .into_iter()
         .map(|(_, t, x, y)| PlanStep {
@@ -886,6 +988,7 @@ fn coordinator(
         cancel,
         evaluated: AtomicU64::new(0),
         iterations: AtomicU64::new(0),
+        fixed_steps: fixed_steps(&layout),
     });
 
     let mut handles = Vec::new();

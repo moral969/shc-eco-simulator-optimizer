@@ -172,6 +172,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut state = state_for_place
                 .lock()
                 .expect("editor state lock should not be poisoned");
+            if state.timeline_previewing() {
+                refresh_geometry_view(
+                    &window,
+                    &state,
+                    "Timeline preview: move to the last step to edit the map",
+                );
+                return;
+            }
             match state.place_selected(x, y, remove_whole_wall) {
                 Ok(PlacementOutcome::Status(message)) => {
                     refresh_geometry_view(&window, &state, &message);
@@ -675,6 +683,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             refresh_view(&window, &state, &message);
         }
     });
+
+    let weak_window = window.as_weak();
+    let state_for_timeline = Arc::clone(&state);
+    window.on_timeline_seek(move |value| {
+        if let Some(window) = weak_window.upgrade() {
+            let mut state = state_for_timeline
+                .lock()
+                .expect("editor state lock should not be poisoned");
+            state.set_timeline_position(value.round().max(0.0) as usize);
+            refresh_static_view(&window, &state);
+            refresh_preview(&window, &state);
+            window.set_simulation_tooltip_visible(false);
+        }
+    });
+
     // ---------------- Optimizer ----------------
     let optimizer_slot: Rc<RefCell<Option<OptimizerHandle>>> = Rc::new(RefCell::new(None));
     let optimizer_log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1075,15 +1098,15 @@ fn refresh_static_view(window: &MainWindow, state: &EditorState) {
     window.set_blacksmiths_weapon(weapon_id(state.blacksmiths_weapon()).into());
     window.set_simulation_tooltips_enabled(state.simulation_tooltips_enabled());
 
-    let cells = visuals::build_occupied_cells(state.simulator());
+    let cells = visuals::build_occupied_cells(state.view_simulator());
     let model = VecModel::from(cells);
     window.set_occupied_cells(ModelRc::new(model));
 
-    let boundaries = visuals::build_building_boundaries(state.simulator());
+    let boundaries = visuals::build_building_boundaries(state.view_simulator());
     let boundary_model = VecModel::from(boundaries);
     window.set_building_boundaries(ModelRc::new(boundary_model));
 
-    let anchor_labels = visuals::build_anchor_labels(state.simulator());
+    let anchor_labels = visuals::build_anchor_labels(state.view_simulator());
     // Note: we reuse the existing `anchor-labels` Slint property to show both
     // building IDs AND anchor markers. For simplicity, anchor markers are drawn
     // as a separate overlay using the same property but with a different prefix.
@@ -1092,17 +1115,26 @@ fn refresh_static_view(window: &MainWindow, state: &EditorState) {
     let anchor_model = VecModel::from(anchor_labels);
     window.set_anchor_labels(ModelRc::new(anchor_model));
 
-    let entry_labels = visuals::build_entry_labels(state.simulator());
+    let entry_labels = visuals::build_entry_labels(state.view_simulator());
     let entry_model = VecModel::from(entry_labels);
     window.set_entry_labels(ModelRc::new(entry_model));
 
-    let no_entry_cells = visuals::build_no_entry_markers(state.simulator());
+    let no_entry_cells = visuals::build_no_entry_markers(state.view_simulator());
     let no_entry_model = VecModel::from(no_entry_cells);
     window.set_no_entry_cells(ModelRc::new(no_entry_model));
 
-    let resource_labels = visuals::build_stockpile_resource_labels(state.simulator());
+    let resource_labels = visuals::build_stockpile_resource_labels(state.view_simulator());
     let resource_model = VecModel::from(resource_labels);
     window.set_resource_labels(ModelRc::new(resource_model));
+
+    refresh_timeline_view(window, state);
+}
+
+fn refresh_timeline_view(window: &MainWindow, state: &EditorState) {
+    window.set_timeline_active(state.timeline_len() > 0);
+    window.set_timeline_count(state.timeline_len() as i32);
+    window.set_timeline_position(state.timeline_position() as f32);
+    window.set_timeline_label(state.timeline_label().into());
 }
 
 fn refresh_preview(window: &MainWindow, state: &EditorState) {
@@ -1201,7 +1233,7 @@ fn refresh_simulation_view(window: &MainWindow, state: &EditorState) {
 }
 
 fn refresh_tooltip_view(window: &MainWindow, state: &EditorState) {
-    if state.simulation_results_stale() {
+    if state.simulation_results_stale() || state.timeline_previewing() {
         window.set_simulation_tooltip_visible(false);
         return;
     }

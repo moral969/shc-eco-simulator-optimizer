@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BuildingPlacement, BuildingType, EntryPoint, Footprint, MapBounds, PopulationEconomySettings,
+    BuildStep, BuildingPlacement, BuildingType, EntryPoint, Footprint, MapBounds, PopulationEconomySettings,
     SimulationSettings, Simulator, SimulatorError, StockpileResource, WallSegment,
 };
 
@@ -23,6 +23,9 @@ pub struct ProjectFile {
     pub simulation: SimulationSettings,
     #[serde(default)]
     pub population_economy: PopulationEconomySettings,
+    /// Порядок строительства (для таймлайна). В старых файлах отсутствует.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_sequence: Vec<BuildStep>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +62,7 @@ impl ProjectFile {
             simulation,
             population_economy,
             next_wheat_layout: Some(simulator.next_wheat_layout()),
+            build_sequence: simulator.build_log().to_vec(),
         }
     }
 
@@ -88,6 +92,9 @@ impl ProjectFile {
         let mut simulator = Simulator::from_saved_layout(bounds, self.buildings, self.walls)?;
         if let Some(layout) = self.next_wheat_layout {
             simulator.restore_next_wheat_layout(layout)?;
+        }
+        if !self.build_sequence.is_empty() {
+            simulator.set_build_log(self.build_sequence);
         }
         Ok((
             simulator,

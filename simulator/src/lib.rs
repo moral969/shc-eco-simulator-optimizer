@@ -1,4 +1,5 @@
 pub mod buildings;
+mod build_log;
 pub mod map;
 mod project;
 pub mod simulation;
@@ -22,6 +23,7 @@ pub use simulation::{
     wheat_output_per_farm_cycle,
 };
 pub use walls::WallSegment;
+pub use build_log::BuildStep;
 pub use optimizer::{
     OptimizationResult, Optimizer, OptimizerConfig, OptimizerEvent, OptimizerHandle, PlanStep,
 };
