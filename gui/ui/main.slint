@@ -397,6 +397,31 @@ component NumberSetting inherits Rectangle {
     }
 }
 
+// Подпись с подсказкой: при наведении отдаёт текст hint наружу (пустую строку при уходе).
+component HintLabel inherits Rectangle {
+    in property <string> title;
+    in property <string> hint;
+    callback hovered(string);
+
+    background: transparent;
+    min-width: label.preferred-width;
+
+    label := Text {
+        width: 100%;
+        height: 100%;
+        text: root.title;
+        color: #1f2937;
+        font-size: 11px;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        changed has-hover => {
+            root.hovered(self.has-hover ? root.hint : "");
+        }
+    }
+}
+
 component ToolButton inherits Rectangle {
     in property <string> title;
     in property <string> tool-id;
@@ -552,6 +577,9 @@ export component MainWindow inherits Window {
     callback set-optimizer-top-solutions(string);
     callback set-optimizer-threads(string);
     in-out property <int> optimizer-threads: 4;
+    callback set-optimizer-max-walls(string);
+    in-out property <int> optimizer-max-walls: 3;
+    private property <string> optimizer-hint: "";
     in property <string> optimizer-log: "";
     callback stop-optimizer();
     callback apply-optimizer-best();
@@ -608,8 +636,11 @@ export component MainWindow inherits Window {
     // Высота карты, которую задаёт пользователь (тянется за разделитель).
     private property <length> map-user-height: 300px;
     // Всё, что занимает место кроме карты: отступы окна и панели, toolbar, разделитель, блоки, spacing.
-    private property <length> map-reserved-height: root.workspace-top + root.outer-padding + 20px + 42px + 6px + root.simulation-block-height + root.optimizer-block-height + 32px;
-    private property <length> map-max-height: max(120px, root.height - root.map-reserved-height);
+    // Высота всего содержимого центральной панели: карта + toolbar + разделитель + блоки
+    // + отступы панели (20px) и spacing (4 x 8px). Если больше окна — появляется прокрутка.
+    private property <length> map-content-height: root.map-effective-height + 42px + 6px + root.simulation-block-height + root.optimizer-block-height + 52px;
+    // Карту можно растягивать вниз сколько угодно, лишнее уходит в прокрутку.
+    private property <length> map-max-height: 4000px;
     // Фактическая высота карты: не меньше 120px и не больше, чем влезает в окно.
     private property <length> map-effective-height: max(120px, min(root.map-user-height, root.map-max-height));
 
@@ -920,10 +951,19 @@ export component MainWindow inherits Window {
         background: #ffffff;
         clip: true;
 
+        map-panel-scroll := ScrollView {
+            width: 100%;
+            height: 100%;
+            viewport-width: map-panel-scroll.visible-width;
+            viewport-height: root.map-content-height;
+
         VerticalBox {
+            width: map-panel-scroll.visible-width;
+            height: root.map-content-height;
             padding: 10px;
             spacing: 8px;
             alignment: start;
+
 
             // --- Toolbar (фиксированная высота) ---
             Rectangle {
@@ -1553,11 +1593,10 @@ export component MainWindow inherits Window {
                         min-height: 28px;
                         max-height: 28px;
 
-                        Text {
-                            color: #1f2937;
-                            text: "Iter/thread";
-                            vertical-alignment: center;
-                            font-size: 11px;
+                        HintLabel {
+                            title: "Iter/thread";
+                            hint: "Итераций отжига на каждый поток. Больше — дольше, но результат лучше.";
+                            hovered(h) => { root.optimizer-hint = h; }
                         }
                         LineEdit {
                             min-width: 70px;
@@ -1566,11 +1605,10 @@ export component MainWindow inherits Window {
                             text: "" + root.optimizer-iterations;
                             edited(t) => { root.set-optimizer-iterations(t); }
                         }
-                        Text {
-                            color: #1f2937;
-                            text: "Threads";
-                            vertical-alignment: center;
-                            font-size: 11px;
+                        HintLabel {
+                            title: "Threads";
+                            hint: "Число параллельных потоков поиска. Обычно число ядер минус один.";
+                            hovered(h) => { root.optimizer-hint = h; }
                         }
                         LineEdit {
                             min-width: 50px;
@@ -1579,11 +1617,10 @@ export component MainWindow inherits Window {
                             text: "" + root.optimizer-threads;
                             edited(t) => { root.set-optimizer-threads(t); }
                         }
-                        Text {
-                            color: #1f2937;
-                            text: "Top N";
-                            vertical-alignment: center;
-                            font-size: 11px;
+                        HintLabel {
+                            title: "Top N";
+                            hint: "Сколько лучших различающихся решений сохранять в optimizer_results.";
+                            hovered(h) => { root.optimizer-hint = h; }
                         }
                         LineEdit {
                             min-width: 50px;
@@ -1591,6 +1628,18 @@ export component MainWindow inherits Window {
                             enabled: !root.optimizer-running;
                             text: "" + root.optimizer-top-solutions;
                             edited(t) => { root.set-optimizer-top-solutions(t); }
+                        }
+                        HintLabel {
+                            title: "Walls";
+                            hint: "Макс. число мастерских со стеной-трюком в решении (длина стены любая). 0 — стены не используются.";
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+                        LineEdit {
+                            min-width: 40px;
+                            max-width: 40px;
+                            enabled: !root.optimizer-running;
+                            text: "" + root.optimizer-max-walls;
+                            edited(t) => { root.set-optimizer-max-walls(t); }
                         }
 
                         // Распорка: прижимает поля влево, чтобы они не растягивались
@@ -1626,7 +1675,7 @@ export component MainWindow inherits Window {
                     }
 
                     Text {
-                        text: root.optimizer-status;
+                        text: root.optimizer-hint != "" ? root.optimizer-hint : root.optimizer-status;
                         font-size: 11px;
                         color: #475569;
                         overflow: elide;
@@ -1643,6 +1692,7 @@ export component MainWindow inherits Window {
                     }
                 }
             }
+        }
         }
     }
 
