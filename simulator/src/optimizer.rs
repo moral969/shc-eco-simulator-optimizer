@@ -22,8 +22,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BuildStep, BuildingType, Footprint, PopulationEconomySettings, ProjectFile, SimulationSettings,
-    Simulator, StockpileResource, walls::line_cells,
+    Simulator, StockpileResource, StyleMetrics, StyleWeights, style_metrics, walls::line_cells,
 };
+
+mod genetic;
 
 /// Отступ от края карты, при котором place_building/place_wall не расширяют карту.
 const MARGIN: i32 = 55;
@@ -33,9 +35,18 @@ const N: i32 = 4;
 const MAX_ROW: usize = 8;
 const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
 
+/// Алгоритм поиска.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptimizerAlgorithm {
+    /// Параллельный симулированный отжиг (поток = независимая цепочка).
+    Annealing,
+    /// Генетический алгоритм (поток = остров со своей популяцией).
+    Genetic,
+}
+
 #[derive(Debug, Clone)]
 pub struct OptimizerConfig {
-    /// Итераций на один поток.
+    /// Итераций на один поток (для генетики — оценок особей).
     pub max_iterations: usize,
     pub threads: usize,
     /// Сколько лучших решений хранить.
@@ -48,6 +59,19 @@ pub struct OptimizerConfig {
     /// Штраф (gold/мин) за каждую использованную попытку стены: чем больше мастерских
     /// разворачивается одной стеной, тем меньше штрафов и тем удобнее строить.
     pub wall_penalty: f64,
+    pub algorithm: OptimizerAlgorithm,
+    /// Веса «аккуратности» расстановки (ряды, выравнивание, диагонали, симметрия), gold/мин.
+    pub style: StyleWeights,
+    /// Генетика: особей в популяции острова.
+    pub population: usize,
+    /// Генетика: сколько лучших особей переходит в следующее поколение без изменений.
+    pub elite: usize,
+    /// Генетика: вероятность скрещивания (иначе ребёнок — копия родителя).
+    pub crossover_rate: f64,
+    /// Генетика: вероятность мутации ребёнка.
+    pub mutation_rate: f64,
+    /// Генетика: размер турнира при выборе родителей.
+    pub tournament: usize,
     pub initial_temperature: f64,
     pub final_temperature: f64,
     pub output_dir: PathBuf,
@@ -65,6 +89,13 @@ impl Default for OptimizerConfig {
             min_diff: 2,
             max_walls: 3,
             wall_penalty: 3.0,
+            algorithm: OptimizerAlgorithm::Annealing,
+            style: StyleWeights::default(),
+            population: 24,
+            elite: 2,
+            crossover_rate: 0.7,
+            mutation_rate: 0.8,
+            tournament: 3,
             initial_temperature: 30.0,
             final_temperature: 0.5,
             output_dir: PathBuf::from("optimizer_results"),
@@ -106,6 +137,10 @@ pub struct OptimizationResult {
     pub score: f64,
     /// Сколько попыток стены использовано в решении.
     pub walls_used: usize,
+    /// Бонус аккуратности, уже входящий в score.
+    pub style_bonus: f64,
+    /// Метрики аккуратности (0..1).
+    pub style: StyleMetrics,
     pub worker: usize,
     pub iteration: usize,
     /// Порядок, в котором выжившие здания были поставлены в последний раз.
@@ -229,20 +264,10 @@ struct Shared {
 }
 
 impl Shared {
-    #[allow(clippy::too_many_arguments)]
-    fn offer(
-        &self,
-        worker: usize,
-        iteration: usize,
-        gold: f64,
-        score: f64,
-        walls_used: usize,
-        sim: &Simulator,
-        plan: &[PlanStep],
-    ) {
+    fn offer(&self, worker: usize, iteration: usize, eval: Eval, sim: &Simulator, plan: &[PlanStep]) {
         {
             let a = self.archive.lock().unwrap_or_else(|e| e.into_inner());
-            if score <= a.threshold() {
+            if eval.score <= a.threshold() {
                 return;
             }
         }
@@ -257,9 +282,11 @@ impl Shared {
         let entry = Entry {
             keys: layout_keys(sim),
             result: OptimizationResult {
-                gold_per_minute: gold,
-                score,
-                walls_used,
+                gold_per_minute: eval.gold,
+                score: eval.score,
+                walls_used: eval.walls_used,
+                style_bonus: eval.bonus,
+                style: eval.style,
                 worker,
                 iteration,
                 build_order,
@@ -436,10 +463,29 @@ fn wall_attempts(sim: &Simulator, plan: &[PlanStep], base: usize) -> usize {
     sim.walls().len().saturating_sub(base) + removed_groups(plan.iter()).len()
 }
 
-/// Оценка отжига: золото минус штраф за использованные попытки стен.
-fn energy(gold: f64, sim: &Simulator, plan: &[PlanStep], budget: WallBudget, penalty: f64) -> (f64, usize) {
-    let used = wall_attempts(sim, plan, budget.base);
-    (gold - penalty * used as f64, used)
+/// Итог оценки раскладки (общий для отжига и генетики).
+#[derive(Debug, Clone, Copy)]
+struct Eval {
+    gold: f64,
+    /// gold − штраф за стены + бонус за аккуратность.
+    score: f64,
+    walls_used: usize,
+    style: StyleMetrics,
+    bonus: f64,
+}
+
+/// Оценка отжига/генетики: золото минус штраф за попытки стен плюс бонус за аккуратность.
+fn judge(gold: f64, sim: &Simulator, plan: &[PlanStep], budget: WallBudget, cfg: &OptimizerConfig) -> Eval {
+    let walls_used = wall_attempts(sim, plan, budget.base);
+    let style = style_metrics(sim, cfg.style.row_target);
+    let bonus = style.bonus(&cfg.style);
+    Eval {
+        gold,
+        score: gold - cfg.wall_penalty.max(0.0) * walls_used as f64 + bonus,
+        walls_used,
+        style,
+        bonus,
+    }
 }
 
 // ---------------------------------------------------------------- evaluation
@@ -471,7 +517,7 @@ fn movable(sim: &Simulator) -> Vec<(u32, BuildingType, i32, i32)> {
 /// Чистое золото/мин по всем мастерским (как в GUI: выручка минус закупка ресурсов).
 /// Железные шахты из population-economy здесь не учитываются.
 fn evaluate(sim: &mut Simulator, settings: SimulationSettings) -> f64 {
-    sim.calculate_worker_distances();
+    sim.calculate_worker_distances_fast();
 
     let mut armouries: Vec<u32> = sim
         .buildings()
@@ -569,20 +615,72 @@ fn mutate(
     progress: f64,
     plan: &[PlanStep],
     budget: WallBudget,
+    style_on: bool,
 ) -> Option<(Simulator, Vec<Change>)> {
     let mut sim = base.clone();
     sim.set_defer_path_calculation(true);
     let mut changes = Vec::new();
     let roll = rng.random_range(0..100);
-    // При max == 0 долю стен отдаём перемещениям, чтобы не гонять пустые итерации.
-    let done = if roll < 45 || (budget.max == 0 && roll < 80) {
+    // Границы долей: relocate | wall_row | snap | swap. Без стен их доля уходит перемещениям,
+    // без весов стиля snap не используется (тогда как раньше: 45 / 35 / 20).
+    let (relocate_to, wall_to, snap_to) = match (budget.max > 0, style_on) {
+        (true, true) => (30, 60, 80),
+        (true, false) => (45, 80, 80),
+        (false, true) => (60, 60, 80),
+        (false, false) => (80, 80, 80),
+    };
+    let done = if roll < relocate_to {
         relocate(&mut sim, rng, progress, &mut changes)
-    } else if roll < 80 {
+    } else if roll < wall_to {
         wall_row(&mut sim, rng, progress, plan, budget, &mut changes)
+    } else if roll < snap_to {
+        snap(&mut sim, rng, &mut changes)
     } else {
         swap(&mut sim, rng, &mut changes)
     };
     done.map(|_| (sim, changes))
+}
+
+/// Прижать здание вплотную к другому (с любой из 8 сторон, включая углы), чтобы получались
+/// ряды, столбцы и диагонали.
+fn snap(sim: &mut Simulator, rng: &mut impl Rng, changes: &mut Vec<Change>) -> Option<()> {
+    let list = movable(sim);
+    let &(id, t, ox, oy) = list.choose(rng)?;
+    let fp = Footprint::for_type(t);
+    let (w, h) = (fp.width() as i32, fp.height() as i32);
+    let targets: Vec<(i32, i32, i32, i32)> = sim
+        .buildings()
+        .iter()
+        .filter(|b| b.id != id && b.building_type != BuildingType::Stockpile)
+        .map(|b| (b.x, b.y, b.width() as i32, b.height() as i32))
+        .collect();
+    let &(tx, ty, tw, th) = targets.choose(rng)?;
+    let xs = [tx - w, tx, tx + tw];
+    let ys = [ty - h, ty, ty + th];
+    let (x, y) = (*xs.choose(rng)?, *ys.choose(rng)?);
+    if (x, y) == (tx, ty) || (x, y) == (ox, oy) {
+        return None;
+    }
+    let bounds = sim.map_bounds();
+    if x < bounds.min_x + MARGIN
+        || y < bounds.min_y + MARGIN
+        || x + w > bounds.max_x - MARGIN
+        || y + h > bounds.max_y - MARGIN
+    {
+        return None;
+    }
+    if !sim.remove_building(id) {
+        return None;
+    }
+    changes.push(Change::Removed { x: ox, y: oy });
+    sim.place_building(t, x, y).ok()?;
+    changes.push(Change::Placed(PlanStep {
+        building_type: t,
+        x,
+        y,
+        wall: None,
+    }));
+    Some(())
 }
 
 fn pick_position(
@@ -749,7 +847,8 @@ fn wall_row(
     let k = chosen.len() as i32;
     for _ in 0..30 {
         let (x, y) = pick_position(sim, rng, first.1, around, radius)?;
-        let rot = rng.random_range(0..4usize);
+        // rot 0 (стена сверху) вход не меняет: он и так снизу. Не тратим на неё попытку.
+        let rot = rng.random_range(1..4usize);
         // Ряд лежит вдоль стены: top/bottom — горизонтально, right/left — вертикально.
         let (w, h) = if rot % 2 == 0 { (N * k, N) } else { (N, N * k) };
         let (sx, sy, ex, ey) = match rot {
@@ -854,7 +953,7 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
     let iters = sh.cfg.max_iterations.max(1);
     let t0 = sh.cfg.initial_temperature.max(1e-6);
     let t1 = sh.cfg.final_temperature.max(1e-6).min(t0);
-    let penalty = sh.cfg.wall_penalty.max(0.0);
+    let style_on = sh.cfg.style.is_active();
     let budget = WallBudget {
         max: sh.cfg.max_walls,
         base: start.walls().len(),
@@ -880,7 +979,7 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
             if sh.cancel.load(Ordering::Relaxed) {
                 return;
             }
-            if let Some((s, ch)) = mutate(&cur, &mut rng, 0.0, &plan, budget) {
+            if let Some((s, ch)) = mutate(&cur, &mut rng, 0.0, &plan, budget, style_on) {
                 cur = s;
                 apply_changes(&mut plan, ch);
             }
@@ -888,11 +987,12 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
     }
 
     let gold = evaluate(&mut cur, settings);
-    let (mut cur_score, used) = energy(gold, &cur, &plan, budget, penalty);
+    let first = judge(gold, &cur, &plan, budget, &sh.cfg);
     sh.evaluated.fetch_add(1, Ordering::Relaxed);
+    let mut cur_score = first.score;
     let mut best_score = cur_score;
     let mut best = (cur.clone(), plan.clone());
-    sh.offer(id, 0, gold, best_score, used, &best.0, &best.1);
+    sh.offer(id, 0, first, &best.0, &best.1);
 
     let patience = (iters / 8).max(300);
     let mut last_improve = 0usize;
@@ -904,22 +1004,24 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
         let progress = i as f64 / iters as f64;
         let temp = t0 * (t1 / t0).powf(progress);
 
-        if let Some((mut cand, changes)) = mutate(&cur, &mut rng, progress, &plan, budget) {
+        if let Some((mut cand, changes)) =
+            mutate(&cur, &mut rng, progress, &plan, budget, style_on)
+        {
             let gold = evaluate(&mut cand, settings);
             let mut cand_plan = plan.clone();
             apply_changes(&mut cand_plan, changes);
-            let (score, used) = energy(gold, &cand, &cand_plan, budget, penalty);
+            let eval = judge(gold, &cand, &cand_plan, budget, &sh.cfg);
             sh.evaluated.fetch_add(1, Ordering::Relaxed);
-            let delta = score - cur_score;
+            let delta = eval.score - cur_score;
             if delta >= 0.0 || rng.random::<f64>() < (delta / temp).exp() {
                 cur = cand;
                 plan = cand_plan;
-                cur_score = score;
-                if score > best_score + 1e-9 {
-                    best_score = score;
+                cur_score = eval.score;
+                if eval.score > best_score + 1e-9 {
+                    best_score = eval.score;
                     best = (cur.clone(), plan.clone());
                     last_improve = i;
-                    sh.offer(id, i, gold, score, used, &best.0, &best.1);
+                    sh.offer(id, i, eval, &best.0, &best.1);
                 }
             }
         }
@@ -967,12 +1069,18 @@ fn coordinator(
     let threads = cfg.threads.max(1);
     let total_iterations = (threads * cfg.max_iterations.max(1)) as f64;
     send(OptimizerEvent::Log(format!(
-        "Старт: {} потоков x {} итераций, подвижных зданий: {}, top {}, попыток стены: {}",
+        "Старт ({:?}): {} потоков x {} итераций, подвижных зданий: {}, top {}, попыток стены: {}, стиль: align {} rows {} diag {} sym {} compact {}",
+        cfg.algorithm,
         threads,
         cfg.max_iterations,
         movable(&layout).len(),
         cfg.top_n,
-        cfg.max_walls
+        cfg.max_walls,
+        cfg.style.align,
+        cfg.style.rows,
+        cfg.style.diagonal,
+        cfg.style.symmetry,
+        cfg.style.compact
     )));
 
     let shared = Arc::new(Shared {
@@ -991,6 +1099,7 @@ fn coordinator(
         fixed_steps: fixed_steps(&layout),
     });
 
+    let algorithm = shared.cfg.algorithm;
     let mut handles = Vec::new();
     for worker in 0..threads {
         let sh = Arc::clone(&shared);
@@ -998,7 +1107,10 @@ fn coordinator(
         handles.push(
             thread::Builder::new()
                 .name(format!("optimizer-{worker}"))
-                .spawn(move || run_worker(worker, start, sh))
+                .spawn(move || match algorithm {
+                    OptimizerAlgorithm::Annealing => run_worker(worker, start, sh),
+                    OptimizerAlgorithm::Genetic => genetic::run_genetic(worker, start, sh),
+                })
                 .expect("optimizer worker"),
         );
     }

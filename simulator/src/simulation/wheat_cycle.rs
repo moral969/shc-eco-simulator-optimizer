@@ -348,6 +348,7 @@ mod tests {
             entry_point: Some(EntryPoint { x: 101, y: 97 }),
             footprint: Footprint::for_type(BuildingType::WheatFarm),
             components: vec![],
+            anchored: false,
         };
         let mut map = CellMap::new(220);
         map.place(&farm).expect("farm fixture");

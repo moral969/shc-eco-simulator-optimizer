@@ -579,6 +579,15 @@ export component MainWindow inherits Window {
     in-out property <int> optimizer-threads: 4;
     callback set-optimizer-max-walls(string);
     in-out property <int> optimizer-max-walls: 3;
+    in-out property <int> optimizer-algorithm: 0;
+    in-out property <string> ga-population: "24";
+    in-out property <string> ga-mutation: "0.8";
+    in-out property <string> w-align: "10";
+    in-out property <string> w-rows: "20";
+    in-out property <string> w-diag: "0";
+    in-out property <string> w-sym: "15";
+    in-out property <string> w-compact: "0";
+    in-out property <string> w-row-target: "4";
     in property <bool> timeline-active: false;
     in property <int> timeline-count: 0;
     in-out property <float> timeline-position: 0;
@@ -635,7 +644,7 @@ export component MainWindow inherits Window {
     private property <length> info-panel-width: max(250px, min(320px, root.width * 0.24));
     private property <length> map-panel-width: max(1px, root.width - root.assets-panel-width - root.info-panel-width - root.outer-padding * 2 - root.panel-gap * 2);
     private property <length> simulation-block-height: 340px;
-    private property <length> optimizer-block-height: 190px;
+    private property <length> optimizer-block-height: 258px;
     private property <length> timeline-block-height: 60px;
     private property <length> workspace-top: 12px;
 
@@ -1719,6 +1728,126 @@ export component MainWindow inherits Window {
                         }
 
                         // Распорка: прижимает поля влево, чтобы они не растягивались
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                    }
+
+                    HorizontalBox {
+                        spacing: 6px;
+                        padding: 0px;
+                        min-height: 28px;
+                        max-height: 28px;
+
+                        HintLabel {
+                            title: "Algorithm";
+                            hint: "Отжиг: одна цепочка поиска на поток. Генетика: популяция на поток со скрещиванием.";
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+                        Button {
+                            min-width: 90px;
+                            max-width: 90px;
+                            text: root.optimizer-algorithm == 0 ? "Annealing" : "Genetic";
+                            enabled: !root.optimizer-running;
+                            clicked => { root.optimizer-algorithm = 1 - root.optimizer-algorithm; }
+                        }
+                        HintLabel {
+                            title: "Pop";
+                            hint: "Генетика: особей в популяции потока. Больше — разнообразнее, но меньше поколений.";
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+                        LineEdit {
+                            min-width: 50px;
+                            max-width: 50px;
+                            enabled: !root.optimizer-running;
+                            text <=> root.ga-population;
+                        }
+                        HintLabel {
+                            title: "Mut";
+                            hint: "Генетика: вероятность мутации ребёнка, 0..1.";
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+                        LineEdit {
+                            min-width: 50px;
+                            max-width: 50px;
+                            enabled: !root.optimizer-running;
+                            text <=> root.ga-mutation;
+                        }
+                        HintLabel {
+                            title: "Row";
+                            hint: "Длина ряда зданий, после которой бонус за ряд перестаёт расти (2..8).";
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+                        LineEdit {
+                            min-width: 40px;
+                            max-width: 40px;
+                            enabled: !root.optimizer-running;
+                            text <=> root.w-row-target;
+                        }
+
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                    }
+
+                    HorizontalBox {
+                        spacing: 6px;
+                        padding: 0px;
+                        min-height: 28px;
+                        max-height: 28px;
+
+                        HintLabel {
+                            title: "Align";
+                            hint: "Вес выравнивания (gold/мин за 100%): здания на общей линии по X или Y.";
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+                        LineEdit {
+                            min-width: 46px;
+                            max-width: 46px;
+                            enabled: !root.optimizer-running;
+                            text <=> root.w-align;
+                        }
+                        HintLabel {
+                            title: "Rows";
+                            hint: "Вес рядов: здания стоят вплотную цепочкой по 2-3-4 в линию.";
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+                        LineEdit {
+                            min-width: 46px;
+                            max-width: 46px;
+                            enabled: !root.optimizer-running;
+                            text <=> root.w-rows;
+                        }
+                        HintLabel {
+                            title: "Diag";
+                            hint: "Вес диагоналей: у здания есть партнёр по диагонали на решётке 4 клетки.";
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+                        LineEdit {
+                            min-width: 46px;
+                            max-width: 46px;
+                            enabled: !root.optimizer-running;
+                            text <=> root.w-diag;
+                        }
+                        HintLabel {
+                            title: "Sym";
+                            hint: "Вес симметрии: зеркальная (по X, по Y или центральная) расстановка относительно центра.";
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+                        LineEdit {
+                            min-width: 46px;
+                            max-width: 46px;
+                            enabled: !root.optimizer-running;
+                            text <=> root.w-sym;
+                        }
+                        HintLabel {
+                            title: "Compact";
+                            hint: "Вес компактности: доля площади зданий в габарите всей группы.";
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+                        LineEdit {
+                            min-width: 46px;
+                            max-width: 46px;
+                            enabled: !root.optimizer-running;
+                            text <=> root.w-compact;
+                        }
+
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                     }
 

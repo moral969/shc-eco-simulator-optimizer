@@ -5,6 +5,7 @@ mod project;
 pub mod simulation;
 pub mod walls;
 pub mod optimizer;
+mod layout_score;
 
 pub use buildings::{
     BuildingComponent, BuildingComponentType, BuildingCost, BuildingPlacement, BuildingType,
@@ -24,8 +25,10 @@ pub use simulation::{
 };
 pub use walls::WallSegment;
 pub use build_log::BuildStep;
+pub use layout_score::{StyleMetrics, StyleWeights, style_metrics};
 pub use optimizer::{
-    OptimizationResult, Optimizer, OptimizerConfig, OptimizerEvent, OptimizerHandle, PlanStep,
+    OptimizationResult, Optimizer, OptimizerAlgorithm, OptimizerConfig, OptimizerEvent,
+    OptimizerHandle, PlanStep,
 };
 
 pub const DEFAULT_MAP_SIZE: usize = 100;

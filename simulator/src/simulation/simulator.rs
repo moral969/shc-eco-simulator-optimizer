@@ -17,7 +17,7 @@ use super::{
         calculate_building_entry, entry_is_accessible, resolve_entry_point_for_square,
         wall_contains_cell,
     },
-    pathfinding::recompute_building_distances,
+    pathfinding::{recompute_building_distances, recompute_worker_distances_fast},
     production_cycle::{
         ProductionCycle, ProductionCycleError, ProductionRouteUsage, SimulationSettings,
         WeaponType, distance_cells, find_building, find_stockpile_for_resource,
@@ -569,6 +569,15 @@ impl Simulator {
     pub fn calculate_worker_distances(&mut self) -> usize {
         self.distances = recompute_building_distances(&self.buildings, &self.map);
         self.recompute_worker_distances();
+        self.worker_distances.len()
+    }
+
+    /// Как calculate_worker_distances, но считает только пары, нужные мастерским (для оптимизатора).
+    /// Таблица всех пар `distances` при этом не заполняется: для отчётов GUI используй обычный метод.
+    pub fn calculate_worker_distances_fast(&mut self) -> usize {
+        self.distances.clear();
+        self.worker_distances = recompute_worker_distances_fast(&self.buildings, &self.map);
+        self.bread_capacities.get_mut().take();
         self.worker_distances.len()
     }
 
@@ -2550,5 +2559,34 @@ mod tests {
         assert_eq!(cycle.route_usage[2].start_building_id, workshop_id);
         assert_eq!(cycle.route_usage[2].finish_building_id, armoury_id);
         assert_eq!(cycle.route_usage[2].trips, 1);
+    }
+
+    #[test]
+    fn fast_worker_distances_match_full_recalculation() {
+        let mut simulator = Simulator::new(60).expect("simulator should be created");
+        simulator
+            .place_building(BuildingType::GoodsYard, 2, 2)
+            .expect("goods yard");
+        simulator
+            .set_stockpile_resource_at(2, 2, StockpileResource::Wood)
+            .expect("wood");
+        simulator
+            .set_stockpile_resource_at(5, 2, StockpileResource::Iron)
+            .expect("iron");
+        simulator
+            .place_building(BuildingType::FletchersWorkshop, 12, 2)
+            .expect("fletcher");
+        simulator
+            .place_building(BuildingType::BlacksmithsWorkshop, 20, 2)
+            .expect("blacksmith");
+        simulator
+            .place_building(BuildingType::Armoury, 30, 10)
+            .expect("armoury");
+        simulator.place_wall(10, 8, 25, 8).expect("wall");
+
+        let mut fast = simulator.clone();
+        simulator.calculate_worker_distances();
+        fast.calculate_worker_distances_fast();
+        assert_eq!(simulator.worker_distances(), fast.worker_distances());
     }
 }

@@ -85,3 +85,44 @@ fn is_workshop(building_type: BuildingType) -> bool {
             | BuildingType::ArmourersWorkshop
     )
 }
+
+/// Пары (старт, финиш), которые нужны циклам мастерских. Логика отбора та же, что в
+/// build_worker_distances: держать в синхроне (это проверяет тест в simulator.rs).
+pub(crate) fn worker_pairs(buildings: &[BuildingPlacement]) -> Vec<(u32, u32)> {
+    let ids_of = |resource| {
+        buildings
+            .iter()
+            .filter(|b| b.stockpile_resource == Some(resource))
+            .map(|b| b.id)
+            .collect::<Vec<_>>()
+    };
+    let wood = ids_of(StockpileResource::Wood);
+    let iron = ids_of(StockpileResource::Iron);
+    let armouries = buildings
+        .iter()
+        .filter(|b| b.building_type == BuildingType::Armoury)
+        .map(|b| b.id)
+        .collect::<Vec<_>>();
+
+    let mut pairs = Vec::new();
+    for workshop in buildings.iter().filter(|b| is_workshop(b.building_type)) {
+        let stockpiles = match workshop.building_type {
+            BuildingType::FletchersWorkshop | BuildingType::PoleturnersWorkshop => &wood,
+            _ => &iron,
+        };
+        for stockpile in stockpiles {
+            pairs.push((workshop.id, *stockpile));
+            pairs.push((*stockpile, workshop.id));
+        }
+        for armoury in &armouries {
+            pairs.push((workshop.id, *armoury));
+            pairs.push((*armoury, workshop.id));
+        }
+    }
+    for armoury in &armouries {
+        for stockpile in wood.iter().chain(&iron) {
+            pairs.push((*armoury, *stockpile));
+        }
+    }
+    pairs
+}

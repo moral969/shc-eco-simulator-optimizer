@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::{EntryPoint, buildings::BuildingPlacement, map::CellMap};
 
-use super::{BuildingDistance, DistanceKey};
+use super::{BuildingDistance, DistanceKey, worker_distance::worker_pairs};
 
 pub(crate) fn recompute_building_distances(
     buildings: &[BuildingPlacement],
@@ -96,6 +96,79 @@ pub(crate) fn shortest_path_len(
     }
 
     None
+}
+
+/// Расстояния от одной точки до всех клеток за один обход (та же восьмисвязная волна, что в shortest_path_len).
+fn distances_from(map: &CellMap, start: EntryPoint) -> Option<Vec<u32>> {
+    if !map.is_in_bounds(start.x, start.y) || map.is_blocked(start.x, start.y) {
+        return None;
+    }
+    let mut dist = vec![u32::MAX; map.width() * map.height()];
+    let mut queue = VecDeque::new();
+    dist[map.index(start.x, start.y)?] = 0;
+    queue.push_back((start.x, start.y));
+
+    while let Some((x, y)) = queue.pop_front() {
+        let current = dist[map.index(x, y)?];
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let (nx, ny) = (x + dx, y + dy);
+                if !map.is_in_bounds(nx, ny) || map.is_blocked(nx, ny) {
+                    continue;
+                }
+                let index = map.index(nx, ny)?;
+                if dist[index] != u32::MAX {
+                    continue;
+                }
+                dist[index] = current + 1;
+                queue.push_back((nx, ny));
+            }
+        }
+    }
+    Some(dist)
+}
+
+/// Только расстояния, нужные мастерским (как build_worker_distances), одним обходом из каждого
+/// старта вместо N^2 обходов. Результат совпадает с recompute_building_distances + build_worker_distances.
+pub(crate) fn recompute_worker_distances_fast(
+    buildings: &[BuildingPlacement],
+    map: &CellMap,
+) -> HashMap<DistanceKey, BuildingDistance> {
+    let mut by_start: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (start, finish) in worker_pairs(buildings) {
+        by_start.entry(start).or_default().push(finish);
+    }
+
+    let find = |id: u32| buildings.iter().find(|b| b.id == id);
+    let mut out = HashMap::new();
+    for (start_id, finishes) in by_start {
+        let Some(start) = find(start_id) else { continue };
+        let dist = start.entry_point.and_then(|entry| distances_from(map, entry));
+        for finish_id in finishes {
+            let Some(finish) = find(finish_id) else { continue };
+            let distance_cells = match (&dist, finish.entry_point) {
+                (Some(dist), Some(entry)) => map
+                    .index(entry.x, entry.y)
+                    .map(|index| dist[index])
+                    .filter(|d| *d != u32::MAX),
+                _ => None,
+            };
+            let key = DistanceKey::new(start_id, finish_id);
+            out.insert(
+                key,
+                BuildingDistance {
+                    key,
+                    start_entry: start.entry_point,
+                    finish_entry: finish.entry_point,
+                    distance_cells,
+                },
+            );
+        }
+    }
+    out
 }
 
 /// A concrete shortest route for crop approaches; ties prefer the target direction.

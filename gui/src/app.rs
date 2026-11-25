@@ -7,8 +7,10 @@ use std::{
 
 use simulator::{
     BREAD_SELL_GOLD, BuildingType, FLOUR_BUY_GOLD, FLOUR_SELL_GOLD, WHEAT_BUY_GOLD,
-    WHEAT_SELL_GOLD, WOOD_BUY_GOLD, WeaponType, Optimizer, OptimizerConfig, OptimizerEvent, OptimizerHandle,
+    WHEAT_SELL_GOLD, WOOD_BUY_GOLD, WeaponType, Optimizer, OptimizerAlgorithm, OptimizerConfig,
+    OptimizerEvent, OptimizerHandle, StyleWeights,
 };
+
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::{
@@ -749,12 +751,33 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     guard.population_economy_settings(),
                 )
             };
+            let defaults = OptimizerConfig::default();
             let config = OptimizerConfig {
                 max_iterations: window.get_optimizer_iterations().max(1) as usize,
                 threads: window.get_optimizer_threads().max(1) as usize,
                 top_n: window.get_optimizer_top_solutions().max(1) as usize,
                 max_walls: window.get_optimizer_max_walls().max(0) as usize,
-                ..OptimizerConfig::default()
+                algorithm: if window.get_optimizer_algorithm() == 1 {
+                    OptimizerAlgorithm::Genetic
+                } else {
+                    OptimizerAlgorithm::Annealing
+                },
+                population: parse_usize(window.get_ga_population().as_str(), defaults.population, 4),
+                mutation_rate: parse_weight(window.get_ga_mutation().as_str(), defaults.mutation_rate)
+                    .min(1.0),
+                style: StyleWeights {
+                    align: parse_weight(window.get_w_align().as_str(), defaults.style.align),
+                    rows: parse_weight(window.get_w_rows().as_str(), defaults.style.rows),
+                    diagonal: parse_weight(window.get_w_diag().as_str(), defaults.style.diagonal),
+                    symmetry: parse_weight(window.get_w_sym().as_str(), defaults.style.symmetry),
+                    compact: parse_weight(window.get_w_compact().as_str(), defaults.style.compact),
+                    row_target: parse_usize(
+                        window.get_w_row_target().as_str(),
+                        defaults.style.row_target,
+                        2,
+                    ),
+                },
+                ..defaults
             };
             *slot.borrow_mut() = Some(Optimizer::start(config, settings, population, layout));
             log.borrow_mut().clear();
@@ -986,6 +1009,22 @@ fn buy_setting_message(resource: &str, enabled: bool, changed: bool) -> &'static
 
 fn parse_positive(text: &str) -> Option<i32> {
     text.trim().parse::<i32>().ok().filter(|v| *v > 0)
+}
+
+fn parse_weight(text: &str, default: f64) -> f64 {
+    text.trim()
+        .replace(',', ".")
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(default)
+}
+
+fn parse_usize(text: &str, default: usize, min: usize) -> usize {
+    text.trim()
+        .parse::<usize>()
+        .ok()
+        .map_or(default, |v| v.max(min))
 }
 
 fn apply_optimizer_best(
