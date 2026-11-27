@@ -56,6 +56,21 @@ impl ProjectSession {
         self.write_project(&path, project)?;
         Ok(Some(path))
     }
+    /// Быстрые показатели над картой хранятся в пользовательских настройках, не в проекте.
+    pub fn load_quick_stats(&self) -> Option<Vec<String>> {
+        fs::read_to_string(self.app_data_dir.join("quick_stats.json"))
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok())
+    }
+
+    pub fn save_quick_stats(&self, ids: &[&str]) -> Result<(), String> {
+        fs::create_dir_all(&self.app_data_dir)
+            .map_err(|error| format!("could not create app-data folder: {error}"))?;
+        let json = serde_json::to_string_pretty(ids)
+            .map_err(|error| format!("could not encode quick stats: {error}"))?;
+        fs::write(self.app_data_dir.join("quick_stats.json"), json)
+            .map_err(|error| format!("could not save quick stats: {error}"))
+    }
 
     pub fn save_as(&mut self, project: &ProjectFile) -> Result<Option<PathBuf>, String> {
         let default_dir = self.default_dialog_dir();

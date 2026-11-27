@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::backend::{BackendCommand, CycleSimulationRow};
+use crate::quick_stats::QuickStatSelection;
 use simulator::{
     BuildingType, DEFAULT_MAP_SIZE, Footprint, PopulationEconomySettings, SimulationSettings,
     Simulator, StockpileResource, WeaponType, clamped_fear_factor, walls::line_cells,
@@ -58,6 +59,8 @@ pub struct EditorState {
     timeline_preview: Option<Simulator>,
     drag: Option<DragState>,
     auto_recalculate: bool,
+    /// Показатели в полосе над картой.
+    quick_stats: QuickStatSelection,
 }
 
 impl EditorState {
@@ -76,7 +79,16 @@ impl EditorState {
             timeline_preview: None,
             drag: None,
             auto_recalculate: false,
+            quick_stats: QuickStatSelection::default(),
         })
+    }
+
+    pub fn quick_stats(&self) -> &QuickStatSelection {
+        &self.quick_stats
+    }
+
+    pub fn quick_stats_mut(&mut self) -> &mut QuickStatSelection {
+        &mut self.quick_stats
     }
 
     pub fn map_size(&self) -> usize {

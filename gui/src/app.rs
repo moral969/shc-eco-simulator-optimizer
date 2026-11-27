@@ -12,10 +12,11 @@ use simulator::{
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::{
-    MainWindow, SimulationCycleItem, SimulationInfoLine,
+    MainWindow, QuickStat, QuickStatOption, SimulationCycleItem, SimulationInfoLine,
     backend::{BackendCommand, BackendHandle, BackendUpdate},
     editor_state::{EditorState, PlacementOutcome},
     project_files::ProjectSession,
+    quick_stats::QuickStatId,
     visuals,
 };
 
@@ -23,6 +24,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let window = MainWindow::new()?;
     let state = Arc::new(Mutex::new(EditorState::new()?));
     let project_session = Arc::new(Mutex::new(ProjectSession::new()));
+
+    // Сохранённый набор быстрых показателей (если есть).
+    {
+        let session = project_session
+            .lock()
+            .expect("project session lock should not be poisoned");
+        if let Some(ids) = session.load_quick_stats() {
+            state
+                .lock()
+                .expect("editor state lock should not be poisoned")
+                .quick_stats_mut()
+                .set_from_ids(&ids);
+        }
+    }
 
     {
         let state = state
@@ -775,6 +790,38 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // ---------------- Быстрые показатели над картой ----------------
+    let weak_window = window.as_weak();
+    let state_for_quick_toggle = Arc::clone(&state);
+    let session_for_quick_toggle = Arc::clone(&project_session);
+    window.on_toggle_quick_stat(move |id| {
+        if let Some(window) = weak_window.upgrade() {
+            let mut state = state_for_quick_toggle
+                .lock()
+                .expect("editor state lock should not be poisoned");
+            if state.quick_stats_mut().toggle(id.as_str()) {
+                persist_quick_stats(&state, &session_for_quick_toggle);
+            } else {
+                window.set_status_text("Quick stats bar is full".into());
+            }
+            refresh_quick_stats(&window, &state);
+        }
+    });
+
+    let weak_window = window.as_weak();
+    let state_for_quick_move = Arc::clone(&state);
+    let session_for_quick_move = Arc::clone(&project_session);
+    window.on_move_quick_stat(move |id, delta| {
+        if let Some(window) = weak_window.upgrade() {
+            let mut state = state_for_quick_move
+                .lock()
+                .expect("editor state lock should not be poisoned");
+            state.quick_stats_mut().move_by(id.as_str(), delta);
+            persist_quick_stats(&state, &session_for_quick_move);
+            refresh_quick_stats(&window, &state);
+        }
+    });
+
     // ---------------- Optimizer ----------------
     let optimizer_slot: Rc<RefCell<Option<OptimizerHandle>>> = Rc::new(RefCell::new(None));
     let optimizer_log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1134,6 +1181,7 @@ fn refresh_geometry_view(window: &MainWindow, state: &EditorState, status: &str)
                 .into(),
         );
         window.set_simulation_tooltip_visible(false);
+        refresh_quick_stats(window, state);
     }
 }
 
@@ -1262,6 +1310,7 @@ fn refresh_simulation_view(window: &MainWindow, state: &EditorState) {
         window.set_simulation_cycles(ModelRc::new(VecModel::from(
             Vec::<SimulationCycleItem>::new(),
         )));
+        refresh_quick_stats(window, state);
         return;
     }
 
@@ -1319,6 +1368,114 @@ fn refresh_simulation_view(window: &MainWindow, state: &EditorState) {
 
     refresh_tooltip_view(window, state);
     refresh_population_economy_view(window, state);
+    // Показатели обновляются после каждого пересчёта симуляции.
+    refresh_quick_stats(window, state);
+}
+
+fn persist_quick_stats(state: &EditorState, session: &Arc<Mutex<ProjectSession>>) {
+    let _ = session
+        .lock()
+        .expect("project session lock should not be poisoned")
+        .save_quick_stats(&state.quick_stats().ids());
+}
+
+fn refresh_quick_stats(window: &MainWindow, state: &EditorState) {
+    // Пока результаты устарели, показываем прочерки.
+    let report = (!state.simulation_results_stale()).then(|| build_population_economy_report(state));
+
+    let stats = state
+        .quick_stats()
+        .enabled()
+        .iter()
+        .map(|stat| {
+            let (value, positive) = match &report {
+                Some(report) => quick_stat_value(state, report, *stat),
+                None => ("—".to_string(), true),
+            };
+            QuickStat {
+                label: stat.label().into(),
+                value: value.into(),
+                unit: stat.unit().into(),
+                positive,
+            }
+        })
+        .collect::<Vec<_>>();
+    window.set_quick_stats(ModelRc::new(VecModel::from(stats)));
+
+    let options = state
+        .quick_stats()
+        .ordered_all()
+        .into_iter()
+        .map(|(stat, enabled)| QuickStatOption {
+            id: stat.id().into(),
+            label: format!("{} · {}", stat.group(), stat.label()).into(),
+            enabled,
+        })
+        .collect::<Vec<_>>();
+    window.set_quick_stat_options(ModelRc::new(VecModel::from(options)));
+}
+
+/// Значение показателя и признак «хорошо» (зелёный/красный).
+fn quick_stat_value(
+    state: &EditorState,
+    report: &simulator::PopulationEconomyReport,
+    stat: QuickStatId,
+) -> (String, bool) {
+    let per_minute = f64::from(state.game_speed()) * 60.0;
+    let signed = |value: f64| (format!("{value:+.1}"), value >= 0.0);
+    let plain = |value: f64| (format!("{value:.1}"), true);
+    let bread = state
+        .simulator()
+        .calculate_bread_economy(state.simulation_settings());
+
+    match stat {
+        QuickStatId::TotalGold => signed(report.total_gold_per_minute),
+        QuickStatId::ArmouryGold => signed(report.workshop_gold_per_minute),
+        QuickStatId::GranaryGold => signed(report.food_gold_per_minute),
+        QuickStatId::Wheat => plain(bread.wheat_per_minute),
+        QuickStatId::Flour => plain(bread.flour_per_minute),
+        QuickStatId::Bread => plain(bread.bread_per_minute),
+        QuickStatId::Weapons => {
+            let iron = calculate_layout_iron_economy(state);
+            plain(
+                state
+                    .cycle_rows()
+                    .iter()
+                    .filter_map(|row| {
+                        let total_ticks = row.total_ticks?;
+                        Some(
+                            row.average_weapons_per_cycle / total_ticks as f64
+                                * effective_workshop_output_scale(row, iron)
+                                * per_minute,
+                        )
+                    })
+                    .sum(),
+            )
+        }
+        QuickStatId::IronUse => plain(report.workshop_iron_demand_per_minute),
+        QuickStatId::WoodUse => plain(
+            state
+                .cycle_rows()
+                .iter()
+                .filter_map(|row| {
+                    let total_ticks = row.total_ticks?;
+                    Some(f64::from(row.wood_per_cycle) / total_ticks as f64 * per_minute)
+                })
+                .sum(),
+        ),
+        QuickStatId::Workers => (report.total_workers.to_string(), true),
+        QuickStatId::FoodEaten => plain(report.food_consumed_per_minute),
+        QuickStatId::Popularity => {
+            if report.settings.enabled {
+                (
+                    format!("{:+}", report.total_popularity),
+                    report.total_popularity >= 0,
+                )
+            } else {
+                ("—".to_string(), true)
+            }
+        }
+    }
 }
 
 fn refresh_tooltip_view(window: &MainWindow, state: &EditorState) {

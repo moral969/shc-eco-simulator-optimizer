@@ -9,6 +9,7 @@ mod app;
 mod backend;
 mod editor_state;
 mod project_files;
+mod quick_stats;
 mod visuals;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

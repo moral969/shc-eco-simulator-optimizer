@@ -33,6 +33,19 @@ export struct SimulationInfoLine {
     text: string,
 }
 
+export struct QuickStat {
+    label: string,
+    value: string,
+    unit: string,
+    positive: bool,
+}
+
+export struct QuickStatOption {
+    id: string,
+    label: string,
+    enabled: bool,
+}
+
 component BuildingButton inherits Rectangle {
     in property <string> title;
     in property <string> building-id;
@@ -149,6 +162,41 @@ component SimulationToggleButton inherits Rectangle {
         }
     }
 }
+
+
+component QuickStatCard inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <string> unit;
+    in property <bool> positive: true;
+
+    preferred-width: 150px;
+    min-width: 90px;
+    max-width: 180px;
+    height: 46px;
+
+    background: transparent;
+    border-width: 0px;
+
+    Text {
+        x: 4px;
+        y: 0px;
+        width: parent.width - 8px;
+        height: 46px;
+
+        text: root.label + "\n" 
+            + root.value
+            + (root.unit == "" ? "" : " " + root.unit);
+
+        color: root.positive ? #141e21ad : #991b1b;
+        font-size: 13px;
+        font-weight: 500;
+
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}
+
 
 component PrimaryActionButton inherits Rectangle {
     in property <string> title;
@@ -530,6 +578,9 @@ export component MainWindow inherits Window {
     in property <string> simulation-info-title: "";
     in property <string> simulation-info-subtitle: "";
     in property <[SimulationInfoLine]> simulation-info-lines;
+    in property <[QuickStat]> quick-stats;
+    in property <[QuickStatOption]> quick-stat-options;
+    in-out property <bool> quick-stats-editor-open: false;
     in-out property <bool> simulation-tooltips-enabled: true;
     in-out property <bool> simulation-tooltip-visible: false;
     in-out property <int> simulation-tooltip-x: 0;
@@ -574,6 +625,8 @@ export component MainWindow inherits Window {
     in property <bool> optimizer-running: false;
     in property <string> optimizer-status: "";
 
+    callback toggle-quick-stat(string);
+    callback move-quick-stat(string, int);
     callback run-optimizer();
     callback set-optimizer-iterations(string);
     callback set-optimizer-top-solutions(string);
@@ -1385,6 +1438,178 @@ export component MainWindow inherits Window {
                                 text: line.text;
                                 color: #4b5563;
                                 wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    // --- Быстрые показатели ---
+                    HorizontalLayout {
+                        x: 8px;
+                        y: 8px;
+                        width: parent.width - 100px;
+                        height: 46px;
+                        spacing: 6px;
+                        alignment: start;
+
+                        for stat in root.quick-stats: QuickStatCard {
+                            label: stat.label;
+                            value: stat.value;
+                            unit: stat.unit;
+                            positive: stat.positive;
+                        }
+                    }
+
+                    // --- Прозрачная кнопка Customize справа ---
+                    Rectangle {
+                        x: parent.width - 84px;
+                        y: 8px;
+                        width: 76px;
+                        height: 24px;
+
+                        background: transparent;
+                        border-width: 0px;
+
+                        Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: "⚙ Customize";
+                            font-size: 10px;
+                            color: #475569;
+                            opacity: customize-touch.has-hover ? 1 : 0.75;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        customize-touch := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+
+                            clicked => {
+                                root.quick-stats-editor-open =
+                                    !root.quick-stats-editor-open;
+                            }
+                        }
+                    }
+
+                    // --- Список показателей: галочки + порядок ---
+                    if root.quick-stats-editor-open: Rectangle {
+                        width: 236px;
+                        height: min(parent.height - 66px, 36px + root.quick-stat-options.length * 24px);
+                        x: parent.width - self.width - 8px;
+                        y: 58px;
+                        border-width: 1px;
+                        border-color: #d3d9e2;
+                        border-radius: 8px;
+                        background: #f5ffffff;
+                        clip: true;
+
+                        Text {
+                            x: 10px;
+                            y: 0px;
+                            width: parent.width - 20px;
+                            height: 28px;
+                            text: "Show on map (max 6)";
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: #1f2937;
+                            vertical-alignment: center;
+                        }
+
+                        ScrollView {
+                            x: 0px;
+                            y: 28px;
+                            width: parent.width;
+                            height: parent.height - 28px;
+
+                            VerticalLayout {
+                                alignment: start;
+
+                                for option in root.quick-stat-options: Rectangle {
+                                    height: 24px;
+                                    background: row-touch.has-hover ? #eef2f7 : transparent;
+
+                                    row-touch := TouchArea {
+                                        clicked => { root.toggle-quick-stat(option.id); }
+                                    }
+
+                                    Rectangle {
+                                        x: 10px;
+                                        y: 5px;
+                                        width: 14px;
+                                        height: 14px;
+                                        border-width: 1px;
+                                        border-radius: 3px;
+                                        border-color: option.enabled ? #1f6db5 : #9aa3af;
+                                        background: option.enabled ? #1f75c1 : #ffffff;
+
+                                        Text {
+                                            width: 100%;
+                                            height: 100%;
+                                            text: option.enabled ? "✓" : "";
+                                            color: #ffffff;
+                                            font-size: 10px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    Text {
+                                        x: 32px;
+                                        y: 0px;
+                                        width: parent.width - 32px - 56px;
+                                        height: 100%;
+                                        text: option.label;
+                                        color: #1f2937;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+
+                                    // Порядок: только у включённых показателей
+                                    if option.enabled: Rectangle {
+                                        x: parent.width - 52px;
+                                        y: 0px;
+                                        width: 22px;
+                                        height: 24px;
+                                        background: transparent;
+
+                                        Text {
+                                            width: 100%;
+                                            height: 100%;
+                                            text: "↑";
+                                            font-size: 12px;
+                                            color: up-touch.has-hover ? #1473c9 : #64748b;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+
+                                        up-touch := TouchArea {
+                                            clicked => { root.move-quick-stat(option.id, -1); }
+                                        }
+                                    }
+
+                                    if option.enabled: Rectangle {
+                                        x: parent.width - 28px;
+                                        y: 0px;
+                                        width: 22px;
+                                        height: 24px;
+                                        background: transparent;
+
+                                        Text {
+                                            width: 100%;
+                                            height: 100%;
+                                            text: "↓";
+                                            font-size: 12px;
+                                            color: down-touch.has-hover ? #1473c9 : #64748b;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+
+                                        down-touch := TouchArea {
+                                            clicked => { root.move-quick-stat(option.id, 1); }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
