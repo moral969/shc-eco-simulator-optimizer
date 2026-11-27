@@ -41,6 +41,18 @@ pub enum BackendCommand {
         x: i32,
         y: i32,
     },
+    /// Перенос постройки: (x, y) — любая её клетка, (new_x, new_y) — новый левый нижний угол.
+    MoveBuilding {
+        x: i32,
+        y: i32,
+        new_x: i32,
+        new_y: i32,
+    },
+    /// Автопересчёт цикла после каждого изменения геометрии.
+    SetAutoRecalculate {
+        enabled: bool,
+        settings: SimulationSettings,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -109,14 +121,69 @@ fn run_backend(
     simulator.set_defer_path_calculation(true);
     let mut history = MapHistory::default();
     let mut paths_stale = true;
+    // Some — автопересчёт включён; внутри актуальные настройки цикла.
+    let mut auto_settings: Option<SimulationSettings> = None;
 
     for command in receiver {
-        let cycle_settings = match &command {
+        let mut cycle_settings = match &command {
             BackendCommand::LoadProject { settings, .. }
             | BackendCommand::RunCycleSimulation { settings } => Some(*settings),
+            BackendCommand::SetAutoRecalculate { enabled, settings } => {
+                auto_settings = enabled.then_some(*settings);
+                None
+            }
             _ => None,
         };
-        let (message, cycle_rows, geometry_changed) = match command {
+        if auto_settings.is_some()
+            && let Some(settings) = cycle_settings
+        {
+            auto_settings = Some(settings);
+        }
+        let (message, mut cycle_rows, geometry_changed) = match command {
+            BackendCommand::MoveBuilding {
+                x,
+                y,
+                new_x,
+                new_y,
+            } => {
+                simulator.set_defer_path_calculation(true);
+                let previous = simulator.clone();
+                let previous_bounds = previous.map_bounds();
+                let result = move_building(&mut simulator, x, y, new_x, new_y);
+                let changed = result.is_ok();
+                (
+                    match result {
+                        Ok(building_type) => {
+                            let expansion =
+                                canvas_expansion_message(previous_bounds, simulator.map_bounds());
+                            history.record(previous);
+                            format!(
+                                "Moved {} to ({}, {}){}",
+                                building_type.display_name(),
+                                new_x,
+                                new_y,
+                                expansion,
+                            )
+                        }
+                        Err(error) => {
+                            // Частично применённый перенос откатываем целиком.
+                            simulator = previous;
+                            format!("Move failed: {}", error)
+                        }
+                    },
+                    None,
+                    changed,
+                )
+            }
+            BackendCommand::SetAutoRecalculate { enabled, .. } => (
+                if enabled {
+                    "Auto recalculation enabled".to_string()
+                } else {
+                    "Auto recalculation disabled".to_string()
+                },
+                None,
+                false,
+            ),
             BackendCommand::PlaceBuilding {
                 building_type,
                 x,
@@ -379,6 +446,17 @@ fn run_backend(
             paths_stale = true;
         }
 
+        // Автопересчёт: после любого изменения построек сразу считаем циклы.
+        if geometry_changed
+            && let Some(settings) = auto_settings
+        {
+            simulator.calculate_worker_distances();
+            paths_stale = false;
+            cycle_rows = Some(build_cycle_simulation_rows(&simulator, settings));
+            simulator.calculate_bread_economy(settings);
+            cycle_settings = Some(settings);
+        }
+
         on_update(BackendUpdate {
             simulator: simulator.clone(),
             message,
@@ -387,6 +465,74 @@ fn run_backend(
             cycle_settings,
         });
     }
+}
+
+/// Переносит постройку через публичное API ядра: удаляет и ставит заново,
+/// затем возвращает назначенные ресурсы складов и якоря.
+/// Goods Yard переносится целиком (стеки получают новые id).
+fn move_building(
+    simulator: &mut Simulator,
+    x: i32,
+    y: i32,
+    new_x: i32,
+    new_y: i32,
+) -> Result<BuildingType, String> {
+    let (target_id, group, target_type) = simulator
+        .buildings()
+        .iter()
+        .find(|building| building.occupied_cells().any(|cell| cell == (x, y)))
+        .map(|building| (building.id, building.goods_yard_group_id, building.building_type))
+        .ok_or("No building at this cell")?;
+
+    // Всё, что нужно восстановить после переноса: (x, y, ресурс, якорь).
+    let moved: Vec<(i32, i32, Option<StockpileResource>, bool)> = simulator
+        .buildings()
+        .iter()
+        .filter(|building| match group {
+            Some(group_id) => building.goods_yard_group_id == Some(group_id),
+            None => building.id == target_id,
+        })
+        .map(|building| {
+            (
+                building.x,
+                building.y,
+                building.stockpile_resource,
+                building.anchored,
+            )
+        })
+        .collect();
+    let origin = moved
+        .iter()
+        .fold((i32::MAX, i32::MAX), |acc, m| (acc.0.min(m.0), acc.1.min(m.1)));
+    let building_type = if group.is_some() {
+        BuildingType::GoodsYard
+    } else {
+        target_type
+    };
+
+    if !simulator.remove_building(target_id) {
+        return Err("could not remove building".to_string());
+    }
+    simulator
+        .place_building(building_type, new_x, new_y)
+        .map_err(|error| error.to_string())?;
+
+    for (bx, by, resource, anchored) in moved {
+        let cell_x = new_x + bx - origin.0;
+        let cell_y = new_y + by - origin.1;
+        if let Some(resource) = resource {
+            simulator
+                .set_stockpile_resource_at(cell_x, cell_y, resource)
+                .map_err(|error| error.to_string())?;
+        }
+        if anchored {
+            simulator
+                .toggle_anchor_at(cell_x, cell_y)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    Ok(building_type)
 }
 
 fn canvas_expansion_message(previous: MapBounds, current: MapBounds) -> String {

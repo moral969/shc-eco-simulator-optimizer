@@ -519,6 +519,8 @@ export component MainWindow inherits Window {
     in-out property <string> status-text: "Ready";
     in property <[OccupiedCellVisual]> occupied-cells;
     in property <[OccupiedCellVisual]> preview-cells;
+    in property <[BuildingBoundary]> preview-boundaries;
+    in-out property <bool> auto-recalculate: false;
     in property <[OccupiedCellVisual]> no-entry-cells;
     in property <[BuildingBoundary]> building-boundaries;
     in property <[MapMarker]> anchor-labels;
@@ -591,6 +593,10 @@ export component MainWindow inherits Window {
 
     callback place-at(float, float, bool);
     callback hover-at(float, float);
+    callback drag-begin(float, float);
+    callback drag-end(float, float);
+    callback drag-cancel();
+    callback set-auto-recalculate(bool);
     callback select-building(string);
     callback clear-selection();
     callback adjust-zoom(float);
@@ -1135,6 +1141,19 @@ export component MainWindow inherits Window {
                                 background: cell.color;
                             }
 
+                            for boundary in root.preview-boundaries: Rectangle {
+                                property <length> line-width: max(2px, root.cell-px / 5);
+                                x: boundary.horizontal
+                                    ? (boundary.x - root.map-min-x) * root.cell-px
+                                    : (boundary.x - root.map-min-x) * root.cell-px - (self.line-width / 2);
+                                y: boundary.horizontal
+                                    ? (root.map-max-y - boundary.y) * root.cell-px - (self.line-width / 2)
+                                    : (root.map-max-y - boundary.y - 1) * root.cell-px;
+                                width: boundary.horizontal ? root.cell-px : self.line-width;
+                                height: boundary.horizontal ? self.line-width : root.cell-px;
+                                background: #2563eb;
+                            }
+
                             for boundary in root.building-boundaries: Rectangle {
                                 property <length> line-width: max(1px, root.cell-px / 6);
                                 x: boundary.horizontal
@@ -1211,6 +1230,7 @@ export component MainWindow inherits Window {
                         property <bool> was-dragging: false;
                         property <bool> pan-active: false;
                         property <bool> wall-drag-active: false;
+                        property <bool> building-drag-active: false;
 
                         moved => {
                             if self.pan-active {
@@ -1255,16 +1275,31 @@ export component MainWindow inherits Window {
                                         root.map-max-y - (self.mouse-y - map-scroll.viewport-y) / root.cell-px,
                                         false,
                                     );
+                                } else if root.selected-building == "" {
+                                    // Инструмент не выбран: тащим постройку под курсором.
+                                    self.building-drag-active = true;
+                                    root.drag-begin(
+                                        root.map-min-x + (self.mouse-x - map-scroll.viewport-x) / root.cell-px,
+                                        root.map-max-y - (self.mouse-y - map-scroll.viewport-y) / root.cell-px,
+                                    );
                                 }
                             }
 
                             if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
-                                root.place-at(
-                                    root.map-min-x + (self.mouse-x - map-scroll.viewport-x) / root.cell-px,
-                                    root.map-max-y - (self.mouse-y - map-scroll.viewport-y) / root.cell-px,
-                                    !self.wall-drag-active && event.modifiers.control,
-                                );
-                                self.wall-drag-active = false;
+                                if self.building-drag-active {
+                                    self.building-drag-active = false;
+                                    root.drag-end(
+                                        root.map-min-x + (self.mouse-x - map-scroll.viewport-x) / root.cell-px,
+                                        root.map-max-y - (self.mouse-y - map-scroll.viewport-y) / root.cell-px,
+                                    );
+                                } else {
+                                    root.place-at(
+                                        root.map-min-x + (self.mouse-x - map-scroll.viewport-x) / root.cell-px,
+                                        root.map-max-y - (self.mouse-y - map-scroll.viewport-y) / root.cell-px,
+                                        !self.wall-drag-active && event.modifiers.control,
+                                    );
+                                    self.wall-drag-active = false;
+                                }
                             }
 
                             if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
@@ -1285,6 +1320,10 @@ export component MainWindow inherits Window {
 
                             if event.kind == PointerEventKind.cancel {
                                 self.pan-active = false;
+                                if self.building-drag-active {
+                                    self.building-drag-active = false;
+                                    root.drag-cancel();
+                                }
                                 if self.wall-drag-active {
                                     self.wall-drag-active = false;
                                     root.clear-selection();
@@ -1496,6 +1535,12 @@ export component MainWindow inherits Window {
                         Rectangle {
                             horizontal-stretch: 1;
                             background: transparent;
+                        }
+
+                        CheckBox {
+                            checked: root.auto-recalculate;
+                            text: "Auto";
+                            toggled => { root.set-auto-recalculate(self.checked); }
                         }
 
                         PrimaryActionButton {

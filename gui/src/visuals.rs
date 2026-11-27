@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use simulator::{BuildingType, Simulator, StockpileResource};
 
-use crate::{BuildingBoundary, MapMarker, OccupiedCellVisual};
+use crate::{BuildingBoundary, MapMarker, OccupiedCellVisual, editor_state::DragPreview};
 
 pub fn building_color(building_type: BuildingType) -> slint::Color {
     match building_type {
@@ -88,6 +88,42 @@ pub fn build_preview_cells(cells: &[(i32, i32)]) -> Vec<OccupiedCellVisual> {
     }
 
     result
+}
+
+pub fn build_drag_cells(preview: &DragPreview) -> Vec<OccupiedCellVisual> {
+    // Красный — место занято, иначе цвет типа постройки с прозрачностью.
+    let color = if preview.blocked {
+        slint::Color::from_argb_u8(190, 220, 40, 40)
+    } else {
+        let base = building_color(preview.building_type);
+        slint::Color::from_argb_u8(190, base.red(), base.green(), base.blue())
+    };
+
+    preview
+        .cells
+        .iter()
+        .map(|(x, y)| OccupiedCellVisual { x: *x, y: *y, color })
+        .collect()
+}
+
+pub fn build_drag_boundaries(preview: &DragPreview) -> Vec<BuildingBoundary> {
+    let mut edges = BTreeSet::new();
+    append_boundary_edges(
+        &mut edges,
+        preview.x,
+        preview.y,
+        preview.width,
+        preview.height,
+    );
+
+    edges
+        .into_iter()
+        .map(|edge| BuildingBoundary {
+            x: edge.x,
+            y: edge.y,
+            horizontal: edge.horizontal,
+        })
+        .collect()
 }
 
 pub fn build_building_boundaries(simulator: &Simulator) -> Vec<BuildingBoundary> {

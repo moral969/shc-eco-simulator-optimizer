@@ -200,6 +200,83 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak_window = window.as_weak();
+    let state_for_drag_begin = Arc::clone(&state);
+    window.on_drag_begin(move |x, y| {
+        if let Some(window) = weak_window.upgrade() {
+            let mut state = state_for_drag_begin
+                .lock()
+                .expect("editor state lock should not be poisoned");
+            if state.timeline_previewing() {
+                return;
+            }
+            if state.begin_drag(x, y) {
+                refresh_preview(&window, &state);
+                window.set_simulation_tooltip_visible(false);
+            }
+        }
+    });
+
+    let weak_window = window.as_weak();
+    let state_for_drag_end = Arc::clone(&state);
+    let backend_for_drag_end = backend.clone();
+    window.on_drag_end(move |x, y| {
+        if let Some(window) = weak_window.upgrade() {
+            let mut state = state_for_drag_end
+                .lock()
+                .expect("editor state lock should not be poisoned");
+            if !state.dragging() {
+                return;
+            }
+            let message = match state.finish_drag(x, y) {
+                Some(command) => match backend_for_drag_end.send(command) {
+                    Ok(()) => "Moving...".to_string(),
+                    Err(error) => error,
+                },
+                None => "Building not moved".to_string(),
+            };
+            refresh_geometry_view(&window, &state, &message);
+        }
+    });
+
+    let weak_window = window.as_weak();
+    let state_for_drag_cancel = Arc::clone(&state);
+    window.on_drag_cancel(move || {
+        if let Some(window) = weak_window.upgrade() {
+            let mut state = state_for_drag_cancel
+                .lock()
+                .expect("editor state lock should not be poisoned");
+            state.cancel_drag();
+            refresh_preview(&window, &state);
+        }
+    });
+
+    let weak_window = window.as_weak();
+    let state_for_auto_recalculate = Arc::clone(&state);
+    let backend_for_auto_recalculate = backend.clone();
+    window.on_set_auto_recalculate(move |enabled| {
+        if let Some(window) = weak_window.upgrade() {
+            let mut state = state_for_auto_recalculate
+                .lock()
+                .expect("editor state lock should not be poisoned");
+            state.set_auto_recalculate(enabled);
+            let settings = state.simulation_settings();
+            let mut result = backend_for_auto_recalculate
+                .send(BackendCommand::SetAutoRecalculate { enabled, settings });
+            // При включении сразу пересчитываем текущую раскладку.
+            if enabled && result.is_ok() {
+                result = backend_for_auto_recalculate
+                    .send(BackendCommand::RunCycleSimulation { settings });
+            }
+            let message = match result {
+                Ok(()) if enabled => "Auto recalculation enabled. Processing simulation...".to_string(),
+                Ok(()) => "Auto recalculation disabled".to_string(),
+                Err(error) => error,
+            };
+            refresh_view(&window, &state, &message);
+        }
+    });
+
+    let weak_window = window.as_weak();
     let state_for_clear = Arc::clone(&state);
     window.on_clear_selection(move || {
         if let Some(window) = weak_window.upgrade() {
@@ -1138,13 +1215,25 @@ fn refresh_timeline_view(window: &MainWindow, state: &EditorState) {
 }
 
 fn refresh_preview(window: &MainWindow, state: &EditorState) {
-    let preview_cells = visuals::build_preview_cells(&state.preview_cells());
+    // При перетаскивании рисуем саму постройку и её границы, иначе обычный предпросмотр.
+    let drag = state.drag_preview();
+    let preview_cells = match &drag {
+        Some(preview) => visuals::build_drag_cells(preview),
+        None => visuals::build_preview_cells(&state.preview_cells()),
+    };
     let preview_model = VecModel::from(preview_cells);
     window.set_preview_cells(ModelRc::new(preview_model));
+
+    let boundaries = drag
+        .as_ref()
+        .map(visuals::build_drag_boundaries)
+        .unwrap_or_default();
+    window.set_preview_boundaries(ModelRc::new(VecModel::from(boundaries)));
 }
 
 fn refresh_simulation_view(window: &MainWindow, state: &EditorState) {
     window.set_simulation_results_stale(state.simulation_results_stale());
+    window.set_auto_recalculate(state.auto_recalculate());
     window.set_optimize_fletcher_routing(state.optimized_fletcher_routing());
     window.set_game_speed(state.game_speed() as i32);
     window.set_fear_factor(state.fear_factor());
@@ -1233,7 +1322,7 @@ fn refresh_simulation_view(window: &MainWindow, state: &EditorState) {
 }
 
 fn refresh_tooltip_view(window: &MainWindow, state: &EditorState) {
-    if state.simulation_results_stale() || state.timeline_previewing() {
+    if state.simulation_results_stale() || state.timeline_previewing() || state.dragging() {
         window.set_simulation_tooltip_visible(false);
         return;
     }

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::backend::{BackendCommand, CycleSimulationRow};
 use simulator::{
     BuildingType, DEFAULT_MAP_SIZE, Footprint, PopulationEconomySettings, SimulationSettings,
@@ -20,6 +22,27 @@ pub enum PlacementOutcome {
     Status(String),
 }
 
+/// Перетаскиваемая постройка (Goods Yard целиком, по левому нижнему углу группы).
+struct DragState {
+    building_type: BuildingType,
+    /// Левый нижний угол постройки в момент захвата.
+    origin: (i32, i32),
+    /// Смещение захваченной клетки от угла постройки.
+    grab_offset: (i32, i32),
+}
+
+/// Что рисовать под курсором при перетаскивании.
+pub struct DragPreview {
+    pub building_type: BuildingType,
+    pub cells: Vec<(i32, i32)>,
+    pub x: i32,
+    pub y: i32,
+    pub width: usize,
+    pub height: usize,
+    /// true — новое место пересекается с другими постройками или стенами.
+    pub blocked: bool,
+}
+
 pub struct EditorState {
     simulator: Simulator,
     selected: Option<SelectedTool>,
@@ -33,6 +56,8 @@ pub struct EditorState {
     /// Шаг таймлайна: 0..=длина журнала. Равен длине — показывается настоящая раскладка.
     timeline_position: usize,
     timeline_preview: Option<Simulator>,
+    drag: Option<DragState>,
+    auto_recalculate: bool,
 }
 
 impl EditorState {
@@ -49,6 +74,8 @@ impl EditorState {
             simulation_results_stale: true,
             timeline_position: 0,
             timeline_preview: None,
+            drag: None,
+            auto_recalculate: false,
         })
     }
 
@@ -540,6 +567,123 @@ impl EditorState {
         Ok(PlacementOutcome::BackendCommand(BackendCommand::ToggleAnchor { x, y }))
     }
 
+    pub fn auto_recalculate(&self) -> bool {
+        self.auto_recalculate
+    }
+
+    pub fn set_auto_recalculate(&mut self, enabled: bool) {
+        self.auto_recalculate = enabled;
+    }
+
+    pub fn dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// Захват постройки под курсором. Работает только когда инструмент не выбран,
+    /// поэтому назначение ресурсов складу, стены и якорь никогда не двигают постройку.
+    pub fn begin_drag(&mut self, x: f32, y: f32) -> bool {
+        self.drag = None;
+        if self.selected.is_some() {
+            return false;
+        }
+
+        let cell = (x.floor() as i32, y.floor() as i32);
+        let Some(building) = self
+            .simulator
+            .buildings()
+            .iter()
+            .find(|building| building.occupied_cells().any(|c| c == cell))
+        else {
+            return false;
+        };
+        let (building_type, origin) = match building.goods_yard_group_id {
+            Some(group_id) => {
+                let origin = self
+                    .simulator
+                    .buildings()
+                    .iter()
+                    .filter(|b| b.goods_yard_group_id == Some(group_id))
+                    .fold((i32::MAX, i32::MAX), |acc, b| (acc.0.min(b.x), acc.1.min(b.y)));
+                (BuildingType::GoodsYard, origin)
+            }
+            None => (building.building_type, (building.x, building.y)),
+        };
+
+        self.drag = Some(DragState {
+            building_type,
+            origin,
+            grab_offset: (cell.0 - origin.0, cell.1 - origin.1),
+        });
+        self.set_hover_cell(x, y);
+        true
+    }
+
+    /// Новый левый нижний угол перетаскиваемой постройки по текущему положению курсора.
+    fn drag_target(&self) -> Option<(i32, i32)> {
+        let drag = self.drag.as_ref()?;
+        let (hover_x, hover_y) = self.hover_cell?;
+        Some((hover_x - drag.grab_offset.0, hover_y - drag.grab_offset.1))
+    }
+
+    /// Завершает перетаскивание; возвращает команду переноса, если постройка сдвинулась.
+    pub fn finish_drag(&mut self, x: f32, y: f32) -> Option<BackendCommand> {
+        self.set_hover_cell(x, y);
+        let target = self.drag_target();
+        let drag = self.drag.take()?;
+        let (new_x, new_y) = target?;
+        if (new_x, new_y) == drag.origin {
+            return None;
+        }
+
+        Some(BackendCommand::MoveBuilding {
+            x: drag.origin.0 + drag.grab_offset.0,
+            y: drag.origin.1 + drag.grab_offset.1,
+            new_x,
+            new_y,
+        })
+    }
+
+    pub fn cancel_drag(&mut self) {
+        self.drag = None;
+    }
+
+    /// Контур и клетки постройки на новом месте (None, если ничего не тащим).
+    pub fn drag_preview(&self) -> Option<DragPreview> {
+        let drag = self.drag.as_ref()?;
+        let (new_x, new_y) = self.drag_target()?;
+        let footprint = Footprint::for_type(drag.building_type);
+        let bounds = self.simulator.map_bounds();
+        // Старые клетки постройки освободятся при переносе, конфликтом они не считаются.
+        let own: HashSet<(i32, i32)> = footprint
+            .occupied_offsets()
+            .map(|(dx, dy)| (drag.origin.0 + dx as i32, drag.origin.1 + dy as i32))
+            .collect();
+
+        let mut cells = Vec::new();
+        let mut blocked = false;
+        for (dx, dy) in footprint.occupied_offsets() {
+            let cell = (new_x + dx as i32, new_y + dy as i32);
+            // Вне карты клетки не рисуем: при установке карта расширится сама.
+            if !bounds.contains(cell.0, cell.1) {
+                continue;
+            }
+            if self.simulator.is_cell_occupied(cell.0, cell.1) && !own.contains(&cell) {
+                blocked = true;
+            }
+            cells.push(cell);
+        }
+
+        Some(DragPreview {
+            building_type: drag.building_type,
+            cells,
+            x: new_x,
+            y: new_y,
+            width: footprint.width(),
+            height: footprint.height(),
+            blocked,
+        })
+    }
+
     pub fn clear_pending_wall(&mut self) {
         self.wall_start = None;
     }
@@ -703,3 +847,6 @@ mod tests {
         ));
     }
 }
+
+
+
