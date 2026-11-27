@@ -852,6 +852,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+    let weak_window = window.as_weak();
+    window.on_set_optimizer_max_cluster(move |text| {
+        if let (Some(w), Ok(v)) = (weak_window.upgrade(), text.trim().parse::<i32>()) {
+            if v >= 0 {
+                w.set_optimizer_max_cluster(v);
+            }
+        }
+    });
 
     {
         let weak_window = window.as_weak();
@@ -878,6 +886,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 threads: window.get_optimizer_threads().max(1) as usize,
                 top_n: window.get_optimizer_top_solutions().max(1) as usize,
                 max_walls: window.get_optimizer_max_walls().max(0) as usize,
+                stockpile_clearance: window.get_optimizer_stock_gap(),
+                keep_groups: window.get_optimizer_keep_groups(),
+                max_cluster_size: window.get_optimizer_max_cluster().max(0) as usize,
                 ..OptimizerConfig::default()
             };
             *slot.borrow_mut() = Some(Optimizer::start(config, settings, population, layout));

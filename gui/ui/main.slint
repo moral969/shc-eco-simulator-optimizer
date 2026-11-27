@@ -549,9 +549,9 @@ export component MainWindow inherits Window {
     preferred-width: 1360px;
     preferred-height: 900px;
     min-width: 1100px;
-    // Фиксированные блоки (toolbar 42 + разделитель 6 + Simulation 340 + Optimizer 190 + отступы) ~654px,
+    // Фиксированные блоки (toolbar 42 + разделитель 6 + Simulation 340 + Optimizer 224 + отступы) ~688px,
     // плюс минимум 120px под карту.
-    min-height: 780px;
+    min-height: 814px;
     title: "SHC Eco Simulator - " + root.current-project-name;
 
     in property <int> map-min-x: 0;
@@ -634,6 +634,10 @@ export component MainWindow inherits Window {
     in-out property <int> optimizer-threads: 4;
     callback set-optimizer-max-walls(string);
     in-out property <int> optimizer-max-walls: 3;
+    in-out property <bool> optimizer-stock-gap: true;
+    in-out property <bool> optimizer-keep-groups: true;
+    in-out property <int> optimizer-max-cluster: 8;
+    callback set-optimizer-max-cluster(string);
     in property <bool> timeline-active: false;
     in property <int> timeline-count: 0;
     in-out property <float> timeline-position: 0;
@@ -694,7 +698,7 @@ export component MainWindow inherits Window {
     private property <length> info-panel-width: max(250px, min(320px, root.width * 0.24));
     private property <length> map-panel-width: max(1px, root.width - root.assets-panel-width - root.info-panel-width - root.outer-padding * 2 - root.panel-gap * 2);
     private property <length> simulation-block-height: 340px;
-    private property <length> optimizer-block-height: 190px;
+    private property <length> optimizer-block-height: 224px;
     private property <length> timeline-block-height: 60px;
     private property <length> workspace-top: 12px;
 
@@ -1989,6 +1993,46 @@ export component MainWindow inherits Window {
                         }
 
                         // Распорка: прижимает поля влево, чтобы они не растягивались
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                    }
+
+                    HorizontalBox {
+                        spacing: 6px;
+                        padding: 0px;
+                        min-height: 28px;
+                        max-height: 28px;
+
+                        CheckBox {
+                            enabled: !root.optimizer-running;
+                            checked <=> root.optimizer-stock-gap;
+                        }
+                        HintLabel {
+                            title: "Stock gap";
+                            hint: "Вокруг склада (и по диагонали) остаётся свободная клетка: здания и стены вплотную к складу не ставятся. Снимите галочку, чтобы отключить.";
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+                        CheckBox {
+                            enabled: !root.optimizer-running;
+                            checked <=> root.optimizer-keep-groups;
+                        }
+                        HintLabel {
+                            title: "Groups";
+                            hint: "Соприкасающиеся здания исходной карты — неделимые группы: двигаются и вращаются только целиком. Выключено — здания двигаются по одному.";
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+                        HintLabel {
+                            title: "Cluster";
+                            hint: "Макс. число зданий в кластере из слипшихся исходных групп. 0 — без ограничения. Не мешает двигать большую группу целиком.";
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+                        LineEdit {
+                            min-width: 40px;
+                            max-width: 40px;
+                            enabled: !root.optimizer-running && root.optimizer-keep-groups;
+                            text: "" + root.optimizer-max-cluster;
+                            edited(t) => { root.set-optimizer-max-cluster(t); }
+                        }
+
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                     }
 

@@ -48,6 +48,13 @@ pub struct OptimizerConfig {
     /// Штраф (gold/мин) за каждую использованную попытку стены: чем больше мастерских
     /// разворачивается одной стеной, тем меньше штрафов и тем удобнее строить.
     pub wall_penalty: f64,
+    /// Вокруг склада (включая диагонали) остаётся свободная клетка: здания вплотную к складу не ставятся.
+    pub stockpile_clearance: bool,
+    /// Соприкасавшиеся на исходной карте здания — неделимые группы (двигаются и вращаются целиком).
+    pub keep_groups: bool,
+    /// Максимум зданий в кластере из слипшихся исходных групп. 0 — без ограничения.
+    /// Не запрещает двигать исходную группу, даже если она сама больше лимита.
+    pub max_cluster_size: usize,
     pub initial_temperature: f64,
     pub final_temperature: f64,
     pub output_dir: PathBuf,
@@ -65,6 +72,9 @@ impl Default for OptimizerConfig {
             min_diff: 2,
             max_walls: 3,
             wall_penalty: 3.0,
+            stockpile_clearance: true,
+            keep_groups: true,
+            max_cluster_size: 8,
             initial_temperature: 30.0,
             final_temperature: 0.5,
             output_dir: PathBuf::from("optimizer_results"),
@@ -304,18 +314,20 @@ fn normalize_plan(plan: &[PlanStep]) -> Vec<PlanStep> {
         let Some(&first) = idx.first() else { continue };
         let Some(wall) = out[first].wall.clone() else { continue };
         let horizontal = wall.side == "top" || wall.side == "bottom";
+        // hi — последняя клетка; размер берём по типу здания (в группе бывают не только 4x4).
         let (lo, hi) = idx.iter().fold((i32::MAX, i32::MIN), |(lo, hi), &i| {
             let v = if horizontal { out[i].x } else { out[i].y };
-            (lo.min(v), hi.max(v))
+            let s = Footprint::for_type(out[i].building_type).width() as i32;
+            (lo.min(v), hi.max(v + s - 1))
         });
         for &i in &idx {
             if let Some(w) = out[i].wall.as_mut() {
                 if horizontal {
                     w.sx = lo;
-                    w.ex = hi + N - 1;
+                    w.ex = hi;
                 } else {
                     w.sy = lo;
-                    w.ey = hi + N - 1;
+                    w.ey = hi;
                 }
             }
         }
@@ -468,6 +480,152 @@ fn movable(sim: &Simulator) -> Vec<(u32, BuildingType, i32, i32)> {
         .collect()
 }
 
+// ---------------------------------------------------------------- groups & rules
+
+/// Ограничения, которые учитываются при генерации вариантов.
+#[derive(Debug, Clone, Copy)]
+struct Rules {
+    /// Вокруг склада (включая диагонали) должна оставаться свободная клетка.
+    clearance: bool,
+    /// Максимум зданий в кластере из нескольких исходных групп (0 — без ограничения).
+    max_cluster: usize,
+}
+
+/// Неделимая группа: здания, соприкасавшиеся на исходной карте.
+/// Двигается и вращается только целиком (ID зданий при переносе меняются, поэтому храним координаты).
+#[derive(Debug, Clone)]
+struct Group {
+    /// (тип, x, y) каждого здания: текущий левый нижний угол.
+    members: Vec<(BuildingType, i32, i32)>,
+}
+
+/// Прямоугольник здания: (x0, y0, x1, y1), x1/y1 не включительно.
+fn rect_of(t: BuildingType, x: i32, y: i32) -> (i32, i32, i32, i32) {
+    let fp = Footprint::for_type(t);
+    (x, y, x + fp.width() as i32, y + fp.height() as i32)
+}
+
+/// Прямоугольники соприкасаются сторонами (общий отрезок границы). Касание одним углом не считается.
+fn rects_touch(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    ((a.2 == b.0 || b.2 == a.0) && a.1 < b.3 && b.1 < a.3)
+        || ((a.3 == b.1 || b.3 == a.1) && a.0 < b.2 && b.0 < a.2)
+}
+
+/// Между прямоугольниками нет свободной клетки: касание сторонами, углом или пересечение.
+fn rects_near(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
+}
+
+/// Исходные группы: компоненты связности подвижных зданий.
+/// При keep_groups = false каждое здание — отдельная группа (прежнее поведение).
+fn initial_groups(sim: &Simulator, keep_groups: bool) -> Vec<Group> {
+    let list = movable(sim);
+    let rects: Vec<_> = list.iter().map(|m| rect_of(m.1, m.2, m.3)).collect();
+    let mut seen = vec![false; list.len()];
+    let mut groups = Vec::new();
+    for start in 0..list.len() {
+        if seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut stack = vec![start];
+        let mut members = Vec::new();
+        while let Some(i) = stack.pop() {
+            members.push((list[i].1, list[i].2, list[i].3));
+            for j in 0..list.len() {
+                if keep_groups && !seen[j] && rects_touch(rects[i], rects[j]) {
+                    seen[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+        groups.push(Group { members });
+    }
+    groups
+}
+
+/// Номер группы, в которую входит здание с левым нижним углом (x, y).
+fn group_index(groups: &[Group], x: i32, y: i32) -> Option<usize> {
+    groups
+        .iter()
+        .position(|g| g.members.iter().any(|m| (m.1, m.2) == (x, y)))
+}
+
+/// Подвижные здания из одиночных групп (их можно двигать по одному).
+fn free_movable(sim: &Simulator, groups: &[Group]) -> Vec<(u32, BuildingType, i32, i32)> {
+    movable(sim)
+        .into_iter()
+        .filter(|m| {
+            group_index(groups, m.2, m.3).is_some_and(|g| groups[g].members.len() == 1)
+        })
+        .collect()
+}
+
+/// Здание не стоит вплотную (в том числе по диагонали) к складу.
+fn clear_of_stockpiles(sim: &Simulator, t: BuildingType, x: i32, y: i32) -> bool {
+    rect_clear_of_stockpiles(sim, rect_of(t, x, y))
+}
+
+/// Прямоугольник не стоит вплотную (в том числе по диагонали) к складу.
+fn rect_clear_of_stockpiles(sim: &Simulator, rect: (i32, i32, i32, i32)) -> bool {
+    !sim.buildings().iter().any(|s| {
+        s.building_type == BuildingType::Stockpile
+            && rects_near(
+                rect,
+                (s.x, s.y, s.x + s.width() as i32, s.y + s.height() as i32),
+            )
+    })
+}
+
+/// Допустимо ли поставить здание t в (x, y) с точки зрения свободной зоны вокруг складов.
+fn placement_ok(sim: &Simulator, rules: Rules, t: BuildingType, x: i32, y: i32) -> bool {
+    !rules.clearance || clear_of_stockpiles(sim, t, x, y)
+}
+
+/// Допустимо ли поставить стену (sx, sy)-(ex, ey): она тоже не стоит вплотную к складу.
+fn wall_ok(sim: &Simulator, rules: Rules, sx: i32, sy: i32, ex: i32, ey: i32) -> bool {
+    !rules.clearance
+        || rect_clear_of_stockpiles(sim, (sx.min(ex), sy.min(ey), sx.max(ex) + 1, sy.max(ey) + 1))
+}
+
+/// Кластер — группы, соприкасающиеся зданиями. Объединение нескольких исходных групп допустимо,
+/// только если в кластере не больше max_cluster зданий. Одиночную группу лимит не ограничивает.
+/// touched — группы, чьё положение изменилось (остальные кластеры не менялись).
+fn clusters_ok(groups: &[Group], touched: &[usize], rules: Rules) -> bool {
+    if rules.max_cluster == 0 {
+        return true;
+    }
+    let rects: Vec<Vec<_>> = groups
+        .iter()
+        .map(|g| g.members.iter().map(|m| rect_of(m.0, m.1, m.2)).collect())
+        .collect();
+    let touch = |a: usize, b: usize| {
+        rects[a]
+            .iter()
+            .any(|ra| rects[b].iter().any(|rb| rects_touch(*ra, *rb)))
+    };
+    for &start in touched {
+        let mut seen = vec![false; groups.len()];
+        seen[start] = true;
+        let mut stack = vec![start];
+        let (mut count, mut size) = (0usize, 0usize);
+        while let Some(g) = stack.pop() {
+            count += 1;
+            size += groups[g].members.len();
+            for other in 0..groups.len() {
+                if !seen[other] && touch(g, other) {
+                    seen[other] = true;
+                    stack.push(other);
+                }
+            }
+        }
+        if count > 1 && size > rules.max_cluster {
+            return false;
+        }
+    }
+    true
+}
+
 /// Чистое золото/мин по всем мастерским (как в GUI: выручка минус закупка ресурсов).
 /// Железные шахты из population-economy здесь не учитываются.
 fn evaluate(sim: &mut Simulator, settings: SimulationSettings) -> f64 {
@@ -552,13 +710,19 @@ fn preflight(sim: &Simulator, settings: SimulationSettings) -> Vec<String> {
 enum Change {
     Removed { x: i32, y: i32 },
     Placed(PlanStep),
+    /// Новый состав группы с номером index (после переноса/поворота/обмена).
+    Group {
+        index: usize,
+        members: Vec<(BuildingType, i32, i32)>,
+    },
 }
 
-fn apply_changes(plan: &mut Vec<PlanStep>, changes: Vec<Change>) {
+fn apply_changes(plan: &mut Vec<PlanStep>, groups: &mut [Group], changes: Vec<Change>) {
     for change in changes {
         match change {
             Change::Removed { x, y } => plan.retain(|s| (s.x, s.y) != (x, y)),
             Change::Placed(step) => plan.push(step),
+            Change::Group { index, members } => groups[index].members = members,
         }
     }
 }
@@ -568,6 +732,8 @@ fn mutate(
     rng: &mut impl Rng,
     progress: f64,
     plan: &[PlanStep],
+    groups: &[Group],
+    rules: Rules,
     budget: WallBudget,
 ) -> Option<(Simulator, Vec<Change>)> {
     let mut sim = base.clone();
@@ -576,11 +742,16 @@ fn mutate(
     let roll = rng.random_range(0..100);
     // При max == 0 долю стен отдаём перемещениям, чтобы не гонять пустые итерации.
     let done = if roll < 45 || (budget.max == 0 && roll < 80) {
-        relocate(&mut sim, rng, progress, &mut changes)
+        // Часть перемещений достаётся целым многозвенным группам.
+        if groups.iter().any(|g| g.members.len() > 1) && rng.random_bool(0.4) {
+            move_group(&mut sim, rng, progress, groups, rules, &mut changes)
+        } else {
+            relocate(&mut sim, rng, progress, groups, rules, &mut changes)
+        }
     } else if roll < 80 {
-        wall_row(&mut sim, rng, progress, plan, budget, &mut changes)
+        wall_row(&mut sim, rng, progress, plan, groups, rules, budget, &mut changes)
     } else {
-        swap(&mut sim, rng, &mut changes)
+        swap(&mut sim, rng, groups, &mut changes)
     };
     done.map(|_| (sim, changes))
 }
@@ -592,9 +763,20 @@ fn pick_position(
     around: (i32, i32),
     radius: i32,
 ) -> Option<(i32, i32)> {
-    let bounds = sim.map_bounds();
     let fp = Footprint::for_type(t);
-    let (w, h) = (fp.width() as i32, fp.height() as i32);
+    pick_position_rect(sim, rng, fp.width() as i32, fp.height() as i32, around, radius)
+}
+
+/// Левый нижний угол прямоугольника w x h рядом с around (без расширения карты).
+fn pick_position_rect(
+    sim: &Simulator,
+    rng: &mut impl Rng,
+    w: i32,
+    h: i32,
+    around: (i32, i32),
+    radius: i32,
+) -> Option<(i32, i32)> {
+    let bounds = sim.map_bounds();
     let (min_x, max_x) = (bounds.min_x + MARGIN, bounds.max_x - MARGIN - w);
     let (min_y, max_y) = (bounds.min_y + MARGIN, bounds.max_y - MARGIN - h);
     if min_x > max_x || min_y > max_y {
@@ -630,18 +812,31 @@ fn relocate(
     sim: &mut Simulator,
     rng: &mut impl Rng,
     progress: f64,
+    groups: &[Group],
+    rules: Rules,
     changes: &mut Vec<Change>,
 ) -> Option<()> {
-    let list = movable(sim);
+    // По одному двигаем только одиночные группы; многозвенные переносит move_group.
+    let list = free_movable(sim, groups);
     let &(id, t, ox, oy) = list.choose(rng)?;
+    let gi = group_index(groups, ox, oy)?;
     let (around, radius) = pick_target(sim, rng, id, (ox, oy), progress)?;
     if !sim.remove_building(id) {
         return None;
     }
     changes.push(Change::Removed { x: ox, y: oy });
+    let mut trial = groups.to_vec();
     for _ in 0..30 {
         let (x, y) = pick_position(sim, rng, t, around, radius)?;
         if (x, y) == (ox, oy) {
+            continue;
+        }
+        // Недопустимые места (зазор у склада, лимит кластера) отбрасываем до постановки.
+        if !placement_ok(sim, rules, t, x, y) {
+            continue;
+        }
+        trial[gi].members = vec![(t, x, y)];
+        if !clusters_ok(&trial, &[gi], rules) {
             continue;
         }
         if sim.place_building(t, x, y).is_ok() {
@@ -651,8 +846,103 @@ fn relocate(
                 y,
                 wall: None,
             }));
+            changes.push(Change::Group {
+                index: gi,
+                members: vec![(t, x, y)],
+            });
             return Some(());
         }
+    }
+    None
+}
+
+/// Перенос и поворот (0/90/180/270°) целой исходной группы: форма и взаимное расположение сохраняются.
+fn move_group(
+    sim: &mut Simulator,
+    rng: &mut impl Rng,
+    progress: f64,
+    groups: &[Group],
+    rules: Rules,
+    changes: &mut Vec<Change>,
+) -> Option<()> {
+    let multi: Vec<usize> = (0..groups.len())
+        .filter(|&i| groups[i].members.len() > 1)
+        .collect();
+    let gi = *multi.choose(rng)?;
+    let members = &groups[gi].members;
+    // Ферма не вращается: у неё фиксированные вход и раскладка поля.
+    let rot = if members.iter().any(|m| m.0 == BuildingType::WheatFarm) {
+        0
+    } else {
+        rng.random_range(0..4usize)
+    };
+    let rotated: Vec<(BuildingType, i32, i32)> = members
+        .iter()
+        .map(|&(t, x, y)| {
+            let s = Footprint::for_type(t).width() as i32;
+            let (rx, ry) = match rot {
+                0 => (x, y),
+                1 => (-y - s + 1, x),
+                2 => (-x - s + 1, -y - s + 1),
+                _ => (y, -x - s + 1),
+            };
+            (t, rx, ry)
+        })
+        .collect();
+    let min_x = rotated.iter().map(|m| m.1).min()?;
+    let min_y = rotated.iter().map(|m| m.2).min()?;
+    let max_x = rotated.iter().map(|m| rect_of(m.0, m.1, m.2).2).max()?;
+    let max_y = rotated.iter().map(|m| rect_of(m.0, m.1, m.2).3).max()?;
+    let (w, h) = (max_x - min_x, max_y - min_y);
+
+    let ids = members
+        .iter()
+        .map(|&(_, x, y)| sim.buildings().iter().find(|b| (b.x, b.y) == (x, y)).map(|b| b.id))
+        .collect::<Option<Vec<u32>>>()?;
+    let old = (members[0].1, members[0].2);
+    let (around, radius) = pick_target(sim, rng, ids[0], old, progress)?;
+    for (&id, m) in ids.iter().zip(members) {
+        if !sim.remove_building(id) {
+            return None;
+        }
+        changes.push(Change::Removed { x: m.1, y: m.2 });
+    }
+
+    for _ in 0..10 {
+        let (bx, by) = pick_position_rect(sim, rng, w, h, around, radius)?;
+        let new_members: Vec<(BuildingType, i32, i32)> = rotated
+            .iter()
+            .map(|&(t, x, y)| (t, x - min_x + bx, y - min_y + by))
+            .collect();
+        if new_members == *members {
+            continue;
+        }
+        let fits = new_members.iter().all(|&(t, x, y)| {
+            let r = rect_of(t, x, y);
+            placement_ok(sim, rules, t, x, y) && area_free(sim, r.0, r.1, r.2 - r.0, r.3 - r.1)
+        });
+        if !fits {
+            continue;
+        }
+        let mut trial = groups.to_vec();
+        trial[gi].members = new_members.clone();
+        if !clusters_ok(&trial, &[gi], rules) {
+            continue;
+        }
+        for &(t, x, y) in &new_members {
+            sim.place_building(t, x, y).ok()?;
+            changes.push(Change::Placed(PlanStep {
+                building_type: t,
+                x,
+                y,
+                wall: None,
+            }));
+        }
+        changes.push(Change::Group {
+            index: gi,
+            members: new_members,
+        });
+        return Some(());
     }
     None
 }
@@ -669,28 +959,45 @@ fn area_free(sim: &Simulator, x: i32, y: i32, w: i32, h: i32) -> bool {
 /// стена убирается (или остаётся). Все мастерские ряда получают повёрнутый вход от одной стены.
 /// Стороны соответствуют workshop_wall_rotation_steps: top->0, right->1, bottom->2, left->3.
 /// Создание стены = 1 попытка, независимо от длины и числа мастерских.
+#[allow(clippy::too_many_arguments)]
 fn wall_row(
     sim: &mut Simulator,
     rng: &mut impl Rng,
     progress: f64,
     plan: &[PlanStep],
+    groups: &[Group],
+    rules: Rules,
     budget: WallBudget,
     changes: &mut Vec<Change>,
 ) -> Option<()> {
-    let workshops: Vec<_> = movable(sim)
+    // В ряд попадают только одиночные группы: здания многозвенных групп разбирать нельзя.
+    let workshops: Vec<_> = free_movable(sim, groups)
         .into_iter()
         .filter(|m| is_workshop(m.1))
         .collect();
+    // Многозвенную группу с мастерской разворачиваем стеной целиком (одна попытка стены на группу).
+    let has_group = groups
+        .iter()
+        .any(|g| g.members.len() > 1 && g.members.iter().any(|m| is_workshop(m.0)));
+    if has_group && (workshops.is_empty() || rng.random_bool(0.4)) {
+        return wall_group(sim, rng, progress, plan, groups, rules, budget, changes);
+    }
     if workshops.is_empty() {
         return None;
     }
+    // Ряд вплотную стоящих одиночных групп — кластер, его размер ограничен max_cluster.
+    let row_cap = if rules.max_cluster == 0 {
+        MAX_ROW
+    } else {
+        MAX_ROW.min(rules.max_cluster)
+    };
 
     // Какие мастерские разворачиваем одной стеной.
     let mut chosen: Vec<(u32, BuildingType, i32, i32)> = Vec::new();
-    let groups: Vec<u32> = removed_groups(plan.iter()).into_iter().collect();
-    if !groups.is_empty() && rng.random_bool(0.5) {
+    let wall_groups: Vec<u32> = removed_groups(plan.iter()).into_iter().collect();
+    if !wall_groups.is_empty() && rng.random_bool(0.5) {
         // Переукладываем существующий ряд целиком и пробуем нарастить его.
-        let g = *groups.choose(rng)?;
+        let g = *wall_groups.choose(rng)?;
         for w in &workshops {
             let in_group = plan
                 .iter()
@@ -700,7 +1007,7 @@ fn wall_row(
             }
         }
         for _ in 0..rng.random_range(0..=2) {
-            if chosen.len() >= MAX_ROW {
+            if chosen.len() >= row_cap {
                 break;
             }
             if let Some(w) = workshops.choose(rng) {
@@ -711,7 +1018,7 @@ fn wall_row(
         }
     } else {
         // Новый ряд: размер смещён в сторону больших рядов.
-        let cap = workshops.len().min(MAX_ROW);
+        let cap = workshops.len().min(row_cap);
         let k = rng.random_range(1..=cap).max(rng.random_range(1..=cap));
         let mut pool = workshops.clone();
         pool.shuffle(rng);
@@ -721,6 +1028,11 @@ fn wall_row(
         return None;
     }
     chosen.shuffle(rng);
+    // Номера исходных групп выбранных мастерских (по старым координатам, до удаления).
+    let gidx = chosen
+        .iter()
+        .map(|c| group_index(groups, c.2, c.3))
+        .collect::<Option<Vec<usize>>>()?;
 
     // Бюджет попыток: оставленные стены + группы со снятой стеной, которые останутся
     // после переукладки выбранных мастерских, + одна новая.
@@ -773,8 +1085,24 @@ fn wall_row(
             .collect();
         let wall_free = line_cells(sx, sy, ex, ey)
             .iter()
-            .all(|&(cx, cy)| !sim.is_cell_occupied(cx, cy));
+            .all(|&(cx, cy)| !sim.is_cell_occupied(cx, cy))
+            && wall_ok(sim, rules, sx, sy, ex, ey);
         if !wall_free || !slots.iter().all(|&(px, py)| area_free(sim, px, py, N, N)) {
+            continue;
+        }
+        // Зазор у складов и лимит кластера проверяем до постройки: недопустимые ряды не генерируем.
+        if !chosen
+            .iter()
+            .zip(&slots)
+            .all(|(c, &(px, py))| placement_ok(sim, rules, c.1, px, py))
+        {
+            continue;
+        }
+        let mut trial_groups = groups.to_vec();
+        for (&g, (c, &(px, py))) in gidx.iter().zip(chosen.iter().zip(&slots)) {
+            trial_groups[g].members = vec![(c.1, px, py)];
+        }
+        if !clusters_ok(&trial_groups, &gidx, rules) {
             continue;
         }
 
@@ -796,7 +1124,11 @@ fn wall_row(
             trial.remove_whole_wall_at(sx, sy);
         }
         *sim = trial;
-        for (c, &(px, py)) in chosen.iter().zip(&slots) {
+        for (i, (c, &(px, py))) in chosen.iter().zip(&slots).enumerate() {
+            changes.push(Change::Group {
+                index: gidx[i],
+                members: vec![(c.1, px, py)],
+            });
             changes.push(Change::Placed(PlanStep {
                 building_type: c.1,
                 x: px,
@@ -817,9 +1149,172 @@ fn wall_row(
     None
 }
 
+/// Поворот группы на rot * 90°: форма и взаимное расположение зданий сохраняются.
+fn rotate_members(
+    members: &[(BuildingType, i32, i32)],
+    rot: usize,
+) -> Vec<(BuildingType, i32, i32)> {
+    members
+        .iter()
+        .map(|&(t, x, y)| {
+            let s = Footprint::for_type(t).width() as i32;
+            let (rx, ry) = match rot {
+                0 => (x, y),
+                1 => (-y - s + 1, x),
+                2 => (-x - s + 1, -y - s + 1),
+                _ => (y, -x - s + 1),
+            };
+            (t, rx, ry)
+        })
+        .collect()
+}
+
+/// wall_row для многозвенной группы: группа переносится и вращается целиком, одна стена ставится
+/// вплотную к стороне её габарита и разворачивает входы мастерских, стоящих на этой стороне.
+/// Стороны те же, что в wall_row: 0 — сверху, 1 — справа, 2 — снизу, 3 — слева.
+#[allow(clippy::too_many_arguments)]
+fn wall_group(
+    sim: &mut Simulator,
+    rng: &mut impl Rng,
+    progress: f64,
+    plan: &[PlanStep],
+    groups: &[Group],
+    rules: Rules,
+    budget: WallBudget,
+    changes: &mut Vec<Change>,
+) -> Option<()> {
+    // Берём группу, в которой есть мастерская: иначе стена ничего не развернёт.
+    let candidates: Vec<usize> = (0..groups.len())
+        .filter(|&i| {
+            groups[i].members.len() > 1 && groups[i].members.iter().any(|m| is_workshop(m.0))
+        })
+        .collect();
+    let gi = *candidates.choose(rng)?;
+    let members = &groups[gi].members;
+
+    // Бюджет попыток: как в wall_row (группа переукладывается целиком + одна новая стена).
+    let member_pos: HashSet<(i32, i32)> = members.iter().map(|m| (m.1, m.2)).collect();
+    let kept_extra = sim.walls().len().saturating_sub(budget.base);
+    let remaining =
+        removed_groups(plan.iter().filter(|s| !member_pos.contains(&(s.x, s.y)))).len();
+    if kept_extra + remaining + 1 > budget.max {
+        return None;
+    }
+    let group = plan
+        .iter()
+        .filter_map(|s| s.wall.as_ref().map(|w| w.group))
+        .max()
+        .map_or(1, |g| g + 1);
+
+    // Ферма не вращается: у неё фиксированные вход и раскладка поля.
+    let rot = if members.iter().any(|m| m.0 == BuildingType::WheatFarm) {
+        0
+    } else {
+        rng.random_range(0..4usize)
+    };
+    let rotated = rotate_members(members, rot);
+    let min_x = rotated.iter().map(|m| m.1).min()?;
+    let min_y = rotated.iter().map(|m| m.2).min()?;
+    let max_x = rotated.iter().map(|m| rect_of(m.0, m.1, m.2).2).max()?;
+    let max_y = rotated.iter().map(|m| rect_of(m.0, m.1, m.2).3).max()?;
+    let (w, h) = (max_x - min_x, max_y - min_y);
+
+    let ids = members
+        .iter()
+        .map(|&(_, x, y)| sim.buildings().iter().find(|b| (b.x, b.y) == (x, y)).map(|b| b.id))
+        .collect::<Option<Vec<u32>>>()?;
+    let old = (members[0].1, members[0].2);
+    let (around, radius) = pick_target(sim, rng, ids[0], old, progress)?;
+    for (&id, m) in ids.iter().zip(members) {
+        if !sim.remove_building(id) {
+            return None;
+        }
+        changes.push(Change::Removed { x: m.1, y: m.2 });
+    }
+
+    for _ in 0..30 {
+        let (bx, by) = pick_position_rect(sim, rng, w, h, around, radius)?;
+        let side = rng.random_range(0..4usize);
+        // Стена вплотную к стороне габарита группы (до MARGIN хватает: карта не расширяется).
+        let (sx, sy, ex, ey) = match side {
+            0 => (bx, by + h, bx + w - 1, by + h),
+            1 => (bx + w, by, bx + w, by + h - 1),
+            2 => (bx, by - 1, bx + w - 1, by - 1),
+            _ => (bx - 1, by, bx - 1, by + h - 1),
+        };
+        let new_members: Vec<(BuildingType, i32, i32)> = rotated
+            .iter()
+            .map(|&(t, x, y)| (t, x - min_x + bx, y - min_y + by))
+            .collect();
+        let fits = new_members.iter().all(|&(t, x, y)| {
+            let r = rect_of(t, x, y);
+            placement_ok(sim, rules, t, x, y) && area_free(sim, r.0, r.1, r.2 - r.0, r.3 - r.1)
+        });
+        let wall_free = line_cells(sx, sy, ex, ey)
+            .iter()
+            .all(|&(cx, cy)| !sim.is_cell_occupied(cx, cy))
+            && wall_ok(sim, rules, sx, sy, ex, ey);
+        if !fits || !wall_free {
+            continue;
+        }
+        let mut trial_groups = groups.to_vec();
+        trial_groups[gi].members = new_members.clone();
+        if !clusters_ok(&trial_groups, &[gi], rules) {
+            continue;
+        }
+
+        let mut trial = sim.clone();
+        if trial.place_wall(sx, sy, ex, ey).is_err() {
+            continue;
+        }
+        if !new_members
+            .iter()
+            .all(|&(t, x, y)| trial.place_building(t, x, y).is_ok())
+        {
+            continue;
+        }
+        // Часть стен оставляем: снимать её необязательно.
+        let kept = rng.random_bool(0.2);
+        if !kept {
+            // клетки были свободны, поэтому последняя стена в этой клетке — наша
+            trial.remove_whole_wall_at(sx, sy);
+        }
+        *sim = trial;
+        changes.push(Change::Group {
+            index: gi,
+            members: new_members.clone(),
+        });
+        for &(t, x, y) in &new_members {
+            changes.push(Change::Placed(PlanStep {
+                building_type: t,
+                x,
+                y,
+                wall: Some(WallPlan {
+                    group,
+                    side: SIDES[side].to_string(),
+                    sx,
+                    sy,
+                    ex,
+                    ey,
+                    kept,
+                }),
+            }));
+        }
+        return Some(());
+    }
+    None
+}
+
 /// Обмен местами двух разных зданий 4x4 (мастерские / оружейка).
-fn swap(sim: &mut Simulator, rng: &mut impl Rng, changes: &mut Vec<Change>) -> Option<()> {
-    let list: Vec<_> = movable(sim)
+fn swap(
+    sim: &mut Simulator,
+    rng: &mut impl Rng,
+    groups: &[Group],
+    changes: &mut Vec<Change>,
+) -> Option<()> {
+    // Меняем местами только одиночные группы. Геометрия (а значит зазор у складов и кластеры)
+    // не меняется: оба здания 4x4 просто обмениваются клетками.
+    let list: Vec<_> = free_movable(sim, groups)
         .into_iter()
         .filter(|m| m.1 == BuildingType::Armoury || is_workshop(m.1))
         .collect();
@@ -828,6 +1323,8 @@ fn swap(sim: &mut Simulator, rng: &mut impl Rng, changes: &mut Vec<Change>) -> O
     if ta == tb {
         return None;
     }
+    let ga = group_index(groups, xa, ya)?;
+    let gb = group_index(groups, xb, yb)?;
     if !(sim.remove_building(ia) && sim.remove_building(ib)) {
         return None;
     }
@@ -843,6 +1340,14 @@ fn swap(sim: &mut Simulator, rng: &mut impl Rng, changes: &mut Vec<Change>) -> O
             wall: None,
         }));
     }
+    changes.push(Change::Group {
+        index: ga,
+        members: vec![(ta, xb, yb)],
+    });
+    changes.push(Change::Group {
+        index: gb,
+        members: vec![(tb, xa, ya)],
+    });
     Some(())
 }
 
@@ -859,6 +1364,15 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
         max: sh.cfg.max_walls,
         base: start.walls().len(),
     };
+    let rules = Rules {
+        clearance: sh.cfg.stockpile_clearance,
+        // Без режима групп лимит кластера не нужен: каждое здание — своя группа.
+        max_cluster: if sh.cfg.keep_groups {
+            sh.cfg.max_cluster_size
+        } else {
+            0
+        },
+    };
 
     let mut cur = start;
     cur.set_defer_path_calculation(true);
@@ -873,6 +1387,8 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
             wall: None,
         })
         .collect();
+    // Исходные группы считаем до перемешивания: дальше они только двигаются целиком.
+    let mut groups = initial_groups(&cur, sh.cfg.keep_groups);
 
     // Потоки кроме первого стартуют из «перемешанной» расстановки — для разнообразия.
     if id > 0 {
@@ -880,9 +1396,9 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
             if sh.cancel.load(Ordering::Relaxed) {
                 return;
             }
-            if let Some((s, ch)) = mutate(&cur, &mut rng, 0.0, &plan, budget) {
+            if let Some((s, ch)) = mutate(&cur, &mut rng, 0.0, &plan, &groups, rules, budget) {
                 cur = s;
-                apply_changes(&mut plan, ch);
+                apply_changes(&mut plan, &mut groups, ch);
             }
         }
     }
@@ -891,7 +1407,7 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
     let (mut cur_score, used) = energy(gold, &cur, &plan, budget, penalty);
     sh.evaluated.fetch_add(1, Ordering::Relaxed);
     let mut best_score = cur_score;
-    let mut best = (cur.clone(), plan.clone());
+    let mut best = (cur.clone(), plan.clone(), groups.clone());
     sh.offer(id, 0, gold, best_score, used, &best.0, &best.1);
 
     let patience = (iters / 8).max(300);
@@ -904,20 +1420,24 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
         let progress = i as f64 / iters as f64;
         let temp = t0 * (t1 / t0).powf(progress);
 
-        if let Some((mut cand, changes)) = mutate(&cur, &mut rng, progress, &plan, budget) {
+        if let Some((mut cand, changes)) =
+            mutate(&cur, &mut rng, progress, &plan, &groups, rules, budget)
+        {
             let gold = evaluate(&mut cand, settings);
             let mut cand_plan = plan.clone();
-            apply_changes(&mut cand_plan, changes);
+            let mut cand_groups = groups.clone();
+            apply_changes(&mut cand_plan, &mut cand_groups, changes);
             let (score, used) = energy(gold, &cand, &cand_plan, budget, penalty);
             sh.evaluated.fetch_add(1, Ordering::Relaxed);
             let delta = score - cur_score;
             if delta >= 0.0 || rng.random::<f64>() < (delta / temp).exp() {
                 cur = cand;
                 plan = cand_plan;
+                groups = cand_groups;
                 cur_score = score;
                 if score > best_score + 1e-9 {
                     best_score = score;
-                    best = (cur.clone(), plan.clone());
+                    best = (cur.clone(), plan.clone(), groups.clone());
                     last_improve = i;
                     sh.offer(id, i, gold, score, used, &best.0, &best.1);
                 }
@@ -928,6 +1448,7 @@ fn run_worker(id: usize, start: Simulator, sh: Arc<Shared>) {
         if i - last_improve > patience {
             cur = best.0.clone();
             plan = best.1.clone();
+            groups = best.2.clone();
             cur_score = best_score;
             last_improve = i;
         }
@@ -973,6 +1494,18 @@ fn coordinator(
         movable(&layout).len(),
         cfg.top_n,
         cfg.max_walls
+    )));
+    let groups = initial_groups(&layout, cfg.keep_groups);
+    send(OptimizerEvent::Log(format!(
+        "Групп: {} (многозвенных: {}), лимит кластера: {}, зазор у складов: {}",
+        groups.len(),
+        groups.iter().filter(|g| g.members.len() > 1).count(),
+        if cfg.keep_groups && cfg.max_cluster_size > 0 {
+            cfg.max_cluster_size.to_string()
+        } else {
+            "нет".to_string()
+        },
+        if cfg.stockpile_clearance { "вкл" } else { "выкл" }
     )));
 
     let shared = Arc::new(Shared {
