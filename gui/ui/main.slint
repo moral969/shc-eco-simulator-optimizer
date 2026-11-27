@@ -700,6 +700,9 @@ export component MainWindow inherits Window {
     private property <length> simulation-block-height: 340px;
     private property <length> optimizer-block-height: 224px;
     private property <length> timeline-block-height: 60px;
+    // --- Нижние вкладки под таймлайном ---
+    in-out property <string> bottom-active-tab: "simulation";
+    private property <length> bottom-tab-content-height: 340px;
     private property <length> workspace-top: 12px;
 
     // Высота карты, которую задаёт пользователь (тянется за разделитель).
@@ -707,7 +710,7 @@ export component MainWindow inherits Window {
     // Всё, что занимает место кроме карты: отступы окна и панели, toolbar, разделитель, блоки, spacing.
     // Высота всего содержимого центральной панели: карта + toolbar + разделитель + блоки
     // + отступы панели (20px) и spacing (4 x 8px). Если больше окна — появляется прокрутка.
-    private property <length> map-content-height: root.map-effective-height + 42px + 6px + root.simulation-block-height + root.optimizer-block-height + root.timeline-block-height + 60px;
+    private property <length> map-content-height: root.map-effective-height + 42px + 6px + root.timeline-block-height + root.bottom-tab-content-height + 60px;
     // Карту можно растягивать вниз сколько угодно, лишнее уходит в прокрутку.
     private property <length> map-max-height: 4000px;
     // Фактическая высота карты: не меньше 120px и не больше, чем влезает в окно.
@@ -1127,8 +1130,8 @@ export component MainWindow inherits Window {
                 padding: 0px;
 
                 Rectangle {
-                    horizontal-stretch: 1;
-                    vertical-stretch: 1;
+                    width: min(parent.width, root.map-effective-height);
+                    height: min(parent.width, root.map-effective-height);
                     border-width: 1px;
                     border-color: #dde3ea;
                     border-radius: 8px;
@@ -1155,6 +1158,7 @@ export component MainWindow inherits Window {
                         map-scroll := ScrollView {
                         width: 100%;
                         height: 100%;
+                        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                         viewport-width: root.map-width-px;
                         viewport-height: root.map-height-px;
                         viewport-x <=> root.canvas-pan-x;
@@ -1721,10 +1725,42 @@ export component MainWindow inherits Window {
                 }
             }
 
-            // --- Simulation (фиксированная высота) ---
+            // --- Tabs: Simulation / Optimization ---
             Rectangle {
-                min-height: root.simulation-block-height;
-                max-height: root.simulation-block-height;
+                min-height: 36px;
+                max-height: 36px;
+                background: transparent;
+
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 6px;
+
+                    Button {
+                        horizontal-stretch: 1;
+                        min-height: 34px;
+                        max-height: 34px;
+                        text: "Simulation";
+                        clicked => {
+                            root.bottom-active-tab = "simulation";
+                        }
+                    }
+
+                    Button {
+                        horizontal-stretch: 1;
+                        min-height: 34px;
+                        max-height: 34px;
+                        text: "Optimization";
+                        clicked => {
+                            root.bottom-active-tab = "optimization";
+                        }
+                    }
+                }
+            }
+
+            // --- Simulation (фиксированная высота) ---
+            if root.bottom-active-tab == "simulation": Rectangle {
+                min-height: root.bottom-tab-content-height;
+                max-height: root.bottom-tab-content-height;
                 border-width: 1px;
                 border-color: #d9dde2;
                 border-radius: 8px;
@@ -1924,9 +1960,9 @@ export component MainWindow inherits Window {
             }
 
             // --- Optimizer (фиксированная высота) ---
-            Rectangle {
-                min-height: root.optimizer-block-height;
-                max-height: root.optimizer-block-height;
+            if root.bottom-active-tab == "optimization": Rectangle {
+                min-height: root.bottom-tab-content-height;
+                max-height: root.bottom-tab-content-height;
                 border-width: 1px;
                 border-color: #d3d9e2;
                 border-radius: 6px;
@@ -1949,8 +1985,8 @@ export component MainWindow inherits Window {
                             hovered(h) => { root.optimizer-hint = h; }
                         }
                         LineEdit {
-                            min-width: 70px;
-                            max-width: 70px;
+                            min-width: 76px;
+                            max-width: 76px;
                             enabled: !root.optimizer-running;
                             text: "" + root.optimizer-iterations;
                             edited(t) => { root.set-optimizer-iterations(t); }
@@ -1961,8 +1997,8 @@ export component MainWindow inherits Window {
                             hovered(h) => { root.optimizer-hint = h; }
                         }
                         LineEdit {
-                            min-width: 50px;
-                            max-width: 50px;
+                            min-width: 60px;
+                            max-width: 60px;
                             enabled: !root.optimizer-running;
                             text: "" + root.optimizer-threads;
                             edited(t) => { root.set-optimizer-threads(t); }
@@ -1973,8 +2009,8 @@ export component MainWindow inherits Window {
                             hovered(h) => { root.optimizer-hint = h; }
                         }
                         LineEdit {
-                            min-width: 50px;
-                            max-width: 50px;
+                            min-width: 64px;
+                            max-width: 64px;
                             enabled: !root.optimizer-running;
                             text: "" + root.optimizer-top-solutions;
                             edited(t) => { root.set-optimizer-top-solutions(t); }
@@ -1985,8 +2021,8 @@ export component MainWindow inherits Window {
                             hovered(h) => { root.optimizer-hint = h; }
                         }
                         LineEdit {
-                            min-width: 40px;
-                            max-width: 40px;
+                            min-width: 64px;
+                            max-width: 64px;
                             enabled: !root.optimizer-running;
                             text: "" + root.optimizer-max-walls;
                             edited(t) => { root.set-optimizer-max-walls(t); }
@@ -2026,8 +2062,8 @@ export component MainWindow inherits Window {
                             hovered(h) => { root.optimizer-hint = h; }
                         }
                         LineEdit {
-                            min-width: 40px;
-                            max-width: 40px;
+                            min-width: 56px;
+                            max-width: 56px;
                             enabled: !root.optimizer-running && root.optimizer-keep-groups;
                             text: "" + root.optimizer-max-cluster;
                             edited(t) => { root.set-optimizer-max-cluster(t); }
