@@ -492,14 +492,14 @@ component ToolButton inherits Rectangle {
         padding: 8px;
         spacing: 8px;
 
-        Rectangle {
+        // if вместо visible: скрытые элементы не занимают место в layout.
+        if !root.use-icon: Rectangle {
             width: 52px;
             height: 28px;
             border-width: 1px;
             border-color: #666666;
             border-radius: 4px;
             background: #ffffff;
-            visible: !root.use-icon;
 
             Rectangle {
                 x: 6px;
@@ -511,30 +511,28 @@ component ToolButton inherits Rectangle {
             }
         }
 
-        Image {
+        if root.use-icon: Image {
             width: 52px;
             height: 28px;
             source: root.icon;
             image-fit: contain;
-            visible: root.use-icon;
         }
 
         Text {
-
+            horizontal-stretch: 1;
             color: #1f2937;
             text: root.title;
             vertical-alignment: center;
             wrap: word-wrap;
         }
 
-        Rectangle {
+        if root.show-color-mark: Rectangle {
             width: 20px;
             height: 20px;
             border-width: 1px;
             border-color: #666666;
             border-radius: 3px;
             background: root.map-color;
-            visible: root.show-color-mark;
         }
     }
 
@@ -542,6 +540,75 @@ component ToolButton inherits Rectangle {
         clicked => {
             root.selected(root.tool-id);
         }
+    }
+}
+
+// Вкладка в стиле браузера: активная сливается с панелью под ней (без нижней границы).
+// Высота: активная 45px (перекрывает верхнюю границу панели), неактивная 40px. Положение по y задаёт родитель.
+component BottomTab inherits Rectangle {
+    in property <string> title;
+    in property <bool> active: false;
+    callback pressed();
+
+    width: 150px;
+    height: root.active ? 45px : 40px;
+
+    private property <color> tab-bg: root.active ? #ffffff : #e9edf3;
+    private property <length> line-height: root.active ? root.height - 12px - 1px : root.height - 12px;
+
+    // Верхняя часть со скруглением.
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 26px;
+        border-width: 1px;
+        border-color: #d9dde2;
+        border-radius: 8px;
+        background: root.tab-bg;
+    }
+
+    // Прямоугольное тело: скрывает нижние скругления верхней части.
+    Rectangle {
+        x: 0px;
+        y: 12px;
+        width: 100%;
+        height: root.height - 12px;
+        background: root.tab-bg;
+    }
+
+    // Боковые границы тела.
+    Rectangle {
+        x: 0px;
+        y: 12px;
+        width: 1px;
+        height: root.line-height;
+        background: #d9dde2;
+    }
+
+    Rectangle {
+        x: root.width - 1px;
+        y: 12px;
+        width: 1px;
+        height: root.line-height;
+        background: #d9dde2;
+    }
+
+    Text {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: root.active ? 36px : 32px;
+        text: root.title;
+        color: root.active ? #1f2937 : #64748b;
+        font-size: 13px;
+        font-weight: root.active ? 700 : 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        clicked => { root.pressed(); }
     }
 }
 
@@ -706,15 +773,19 @@ export component MainWindow inherits Window {
     private property <length> workspace-top: 12px;
 
     // Высота карты, которую задаёт пользователь (тянется за разделитель).
-    private property <length> map-user-height: 300px;
+    // Отклонение высоты карты от автоматической (тянется за разделитель).
+    private property <length> map-height-delta: 0px;
+    // Высота карты, при которой содержимое центральной панели ровно помещается в окно:
+    // toolbar 42 + разделитель 6 + timeline + вкладки 36 + блок вкладки + отступы/spacing 64.
+    private property <length> map-auto-height: root.height - root.workspace-top - root.outer-padding - 42px - 6px - root.timeline-block-height - 36px - root.bottom-tab-content-height - 64px;
     // Всё, что занимает место кроме карты: отступы окна и панели, toolbar, разделитель, блоки, spacing.
     // Высота всего содержимого центральной панели: карта + toolbar + разделитель + блоки
     // + отступы панели (20px) и spacing (4 x 8px). Если больше окна — появляется прокрутка.
-    private property <length> map-content-height: root.map-effective-height + 42px + 6px + root.timeline-block-height + root.bottom-tab-content-height + 60px;
+    private property <length> map-content-height: root.map-effective-height + 42px + 6px + root.timeline-block-height + root.bottom-tab-content-height + 96px;
     // Карту можно растягивать вниз сколько угодно, лишнее уходит в прокрутку.
     private property <length> map-max-height: 4000px;
     // Фактическая высота карты: не меньше 120px и не больше, чем влезает в окно.
-    private property <length> map-effective-height: max(120px, min(root.map-user-height, root.map-max-height));
+    private property <length> map-effective-height: max(120px, root.map-auto-height + root.map-height-delta);
 
     init => {
         Palette.color-scheme = ColorScheme.light;
@@ -1130,8 +1201,8 @@ export component MainWindow inherits Window {
                 padding: 0px;
 
                 Rectangle {
-                    width: min(parent.width, root.map-effective-height);
-                    height: min(parent.width, root.map-effective-height);
+                    // Карта занимает всю ширину панели и меняется вместе с окном.
+                    horizontal-stretch: 1;
                     border-width: 1px;
                     border-color: #dde3ea;
                     border-radius: 8px;
@@ -1646,9 +1717,9 @@ export component MainWindow inherits Window {
                     moved => {
                         if self.pressed {
                             // Разделитель двигается вместе с картой, поэтому дельта считается инкрементально.
-                            root.map-user-height = max(
-                                120px,
-                                min(root.map-max-height, root.map-effective-height + (self.mouse-y - self.press-y)),
+                            root.map-height-delta = max(
+                                120px - root.map-auto-height,
+                                root.map-height-delta + (self.mouse-y - self.press-y),
                             );
                         }
                     }
@@ -1725,35 +1796,29 @@ export component MainWindow inherits Window {
                 }
             }
 
-            // --- Tabs: Simulation / Optimization ---
+            // --- Tabs: Simulation / Optimization (в стиле браузерных вкладок) ---
+            // z: 1 — вкладка рисуется поверх верхней границы панели и «сливается» с ней.
             Rectangle {
                 min-height: 36px;
                 max-height: 36px;
                 background: transparent;
+                z: 1;
 
-                HorizontalBox {
-                    padding: 0px;
-                    spacing: 6px;
+                BottomTab {
+                    // x: 12px — отступ от скруглённого угла панели.
+                    x: 12px;
+                    y: root.bottom-active-tab == "simulation" ? 0px : 4px;
+                    title: "Simulation";
+                    active: root.bottom-active-tab == "simulation";
+                    pressed => { root.bottom-active-tab = "simulation"; }
+                }
 
-                    Button {
-                        horizontal-stretch: 1;
-                        min-height: 34px;
-                        max-height: 34px;
-                        text: "Simulation";
-                        clicked => {
-                            root.bottom-active-tab = "simulation";
-                        }
-                    }
-
-                    Button {
-                        horizontal-stretch: 1;
-                        min-height: 34px;
-                        max-height: 34px;
-                        text: "Optimization";
-                        clicked => {
-                            root.bottom-active-tab = "optimization";
-                        }
-                    }
+                BottomTab {
+                    x: 12px + 150px + 4px;
+                    y: root.bottom-active-tab == "optimization" ? 0px : 4px;
+                    title: "Optimization";
+                    active: root.bottom-active-tab == "optimization";
+                    pressed => { root.bottom-active-tab = "optimization"; }
                 }
             }
 
@@ -1964,9 +2029,9 @@ export component MainWindow inherits Window {
                 min-height: root.bottom-tab-content-height;
                 max-height: root.bottom-tab-content-height;
                 border-width: 1px;
-                border-color: #d3d9e2;
-                border-radius: 6px;
-                background: #fbfcfe;
+                border-color: #d9dde2;
+                border-radius: 8px;
+                background: #ffffff;
                 clip: true;
 
                 VerticalBox {
