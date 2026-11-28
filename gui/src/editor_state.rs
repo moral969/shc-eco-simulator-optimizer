@@ -57,6 +57,7 @@ pub struct EditorState {
     /// Шаг таймлайна: 0..=длина журнала. Равен длине — показывается настоящая раскладка.
     timeline_position: usize,
     timeline_preview: Option<Simulator>,
+    candidate: Option<Simulator>,
     drag: Option<DragState>,
     auto_recalculate: bool,
     /// Показатели в полосе над картой.
@@ -77,6 +78,7 @@ impl EditorState {
             simulation_results_stale: true,
             timeline_position: 0,
             timeline_preview: None,
+            candidate: None,
             drag: None,
             auto_recalculate: false,
             quick_stats: QuickStatSelection::default(),
@@ -101,18 +103,21 @@ impl EditorState {
 
     pub fn set_simulator(&mut self, simulator: Simulator) {
         // Любое изменение от бэкенда возвращает таймлайн на последний шаг.
-        self.timeline_position = simulator.build_log().len();
-        self.timeline_preview = None;
         self.simulator = simulator;
+        self.timeline_position = self.timeline_len();
+        self.timeline_preview = None;
     }
 
     /// Что рисовать на карте: проигранный до выбранного шага симулятор или настоящий.
     pub fn view_simulator(&self) -> &Simulator {
-        self.timeline_preview.as_ref().unwrap_or(&self.simulator)
+        self.timeline_preview
+            .as_ref()
+            .or(self.candidate.as_ref())
+            .unwrap_or(&self.simulator)
     }
 
     pub fn timeline_len(&self) -> usize {
-        self.simulator.build_log().len()
+        self.timeline_source().build_log().len()
     }
 
     pub fn timeline_position(&self) -> usize {
@@ -120,7 +125,25 @@ impl EditorState {
     }
 
     pub fn timeline_previewing(&self) -> bool {
-        self.timeline_preview.is_some()
+        self.timeline_preview.is_some() || self.candidate.is_some()
+    }
+
+    /// Расстановка, по журналу которой работает таймлайн: вариант оптимизатора или текущая карта.
+    fn timeline_source(&self) -> &Simulator {
+        self.candidate.as_ref().unwrap_or(&self.simulator)
+    }
+
+    pub fn candidate_open(&self) -> bool {
+        self.candidate.is_some()
+    }
+
+    /// Открывает вариант оптимизатора на карте (None — закрыть). Таймлайн встаёт на последний шаг.
+    pub fn set_candidate(&mut self, candidate: Option<Simulator>) {
+        self.candidate = candidate;
+        self.timeline_preview = None;
+        self.timeline_position = self.timeline_len();
+        self.drag = None;
+        self.wall_start = None;
     }
 
     pub fn set_timeline_position(&mut self, position: usize) {
@@ -133,7 +156,7 @@ impl EditorState {
         self.timeline_preview = if position >= len {
             None
         } else {
-            self.simulator.replay_build_log(position)
+            self.timeline_source().replay_build_log(position)
         };
     }
 
@@ -150,7 +173,7 @@ impl EditorState {
             "Step {} / {}: {}",
             position,
             len,
-            self.simulator.build_log()[position - 1].describe()
+            self.timeline_source().build_log()[position - 1].describe()
         )
     }
 

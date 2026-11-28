@@ -46,6 +46,11 @@ export struct QuickStatOption {
     enabled: bool,
 }
 
+export struct OptimizerCandidate {
+    title: string,
+    detail: string,
+}
+
 component BuildingButton inherits Rectangle {
     in property <string> title;
     in property <string> building-id;
@@ -612,6 +617,90 @@ component BottomTab inherits Rectangle {
     }
 }
 
+// Компактная кнопка режима (выбор режима такой же, как в панели зданий).
+component ToolChip inherits Rectangle {
+    in property <string> title;
+    in property <string> tool-id;
+    in property <string> selected-id;
+    in property <string> hint;
+    callback selected(string);
+    callback hovered(string);
+
+    min-width: 90px;
+    max-width: 90px;
+    border-width: 2px;
+    border-radius: 6px;
+    border-color: selected-id == tool-id ? #3465d9 : #8a8a8a;
+    background: selected-id == tool-id ? #e9f0ff : #f7f7f7;
+
+    Text {
+        width: 100%;
+        height: 100%;
+        text: root.title;
+        color: #1f2937;
+        font-size: 12px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        clicked => { root.selected(root.tool-id); }
+        changed has-hover => {
+            root.hovered(self.has-hover ? root.hint : "");
+        }
+    }
+}
+
+// Карточка варианта оптимизатора: по нажатию вариант открывается на карте.
+component CandidateCard inherits Rectangle {
+    in property <string> title;
+    in property <string> detail;
+    in property <bool> active: false;
+    in property <bool> control-enabled: true;
+    callback pressed();
+
+    min-height: 46px;
+    max-height: 46px;
+    horizontal-stretch: 1;
+    border-width: 2px;
+    border-radius: 6px;
+    border-color: root.active ? #3465d9 : #cfd6df;
+    background: root.active ? #e9f0ff : #ffffff;
+    opacity: root.control-enabled ? 1 : 0.55;
+    clip: true;
+
+    Text {
+        x: 10px;
+        y: 5px;
+        width: parent.width - 20px;
+        height: 18px;
+        text: root.title;
+        font-size: 12px;
+        font-weight: 700;
+        color: #1f2937;
+        overflow: elide;
+        vertical-alignment: center;
+    }
+
+    Text {
+        x: 10px;
+        y: 24px;
+        width: parent.width - 20px;
+        height: 16px;
+        text: root.detail;
+        font-size: 10px;
+        color: #64748b;
+        overflow: elide;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        enabled: root.control-enabled;
+        clicked => { root.pressed(); }
+    }
+}
+
 export component MainWindow inherits Window {
     preferred-width: 1360px;
     preferred-height: 900px;
@@ -688,7 +777,7 @@ export component MainWindow inherits Window {
     in property <string> population-worker-summary: "";
     in property <string> population-economy-summary: "";
     in-out property <int> optimizer-iterations: 500;
-    in-out property <int> optimizer-top-solutions: 5;
+    in-out property <int> optimizer-top-solutions: 3;
     in property <bool> optimizer-running: false;
     in property <string> optimizer-status: "";
 
@@ -702,7 +791,7 @@ export component MainWindow inherits Window {
     callback set-optimizer-max-walls(string);
     in-out property <int> optimizer-max-walls: 3;
     in-out property <bool> optimizer-stock-gap: true;
-    in-out property <bool> optimizer-keep-groups: true;
+    in-out property <bool> optimizer-keep-groups: false;
     in-out property <int> optimizer-max-cluster: 8;
     callback set-optimizer-max-cluster(string);
     in property <bool> timeline-active: false;
@@ -713,7 +802,11 @@ export component MainWindow inherits Window {
     private property <string> optimizer-hint: "";
     in property <string> optimizer-log: "";
     callback stop-optimizer();
-    callback apply-optimizer-best();
+        callback select-optimizer-candidate(int);
+    callback apply-optimizer-candidate();
+    callback close-optimizer-candidate();
+    in property <[OptimizerCandidate]> optimizer-candidates;
+    in-out property <int> optimizer-selected-candidate: -1;
 
     callback place-at(float, float, bool);
     callback hover-at(float, float);
@@ -1065,18 +1158,6 @@ export component MainWindow inherits Window {
                         map-color: #78543e;
                         selected(id) => { root.select-building(id); }
                     }
-
-                    ToolButton {
-                    title: "Anchor";
-                    tool-id: "anchor";
-                    selected-id: root.selected-building;
-                    map-color: #d946ef;
-                    show-color-mark: false;
-                    show-line-icon: false;
-                    use-icon: false;
-                    selected(id) => { root.select-building(id); }
-                }
-
                 }
             }
         }
@@ -2034,6 +2115,19 @@ export component MainWindow inherits Window {
                 background: #ffffff;
                 clip: true;
 
+                // Клик по свободному месту вкладки закрывает просмотр варианта (как Cancel).
+                // Кнопки, поля и карточки лежат выше и перехватывают клик сами;
+                // если вариант не выбран — ничего не происходит.
+                TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => {
+                        if root.optimizer-selected-candidate >= 0 {
+                            root.close-optimizer-candidate();
+                        }
+                    }
+                }
+
                 VerticalBox {
                     padding: 8px;
                     spacing: 6px;
@@ -2067,18 +2161,6 @@ export component MainWindow inherits Window {
                             enabled: !root.optimizer-running;
                             text: "" + root.optimizer-threads;
                             edited(t) => { root.set-optimizer-threads(t); }
-                        }
-                        HintLabel {
-                            title: "Top N";
-                            hint: "Сколько лучших различающихся решений сохранять в optimizer_results.";
-                            hovered(h) => { root.optimizer-hint = h; }
-                        }
-                        LineEdit {
-                            min-width: 64px;
-                            max-width: 64px;
-                            enabled: !root.optimizer-running;
-                            text: "" + root.optimizer-top-solutions;
-                            edited(t) => { root.set-optimizer-top-solutions(t); }
                         }
                         HintLabel {
                             title: "Walls";
@@ -2137,6 +2219,29 @@ export component MainWindow inherits Window {
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                     }
 
+                    // Anchor стоит отдельной строкой над Optimize Layout.
+                    HorizontalBox {
+                        spacing: 6px;
+                        padding: 0px;
+                        min-height: 28px;
+                        max-height: 28px;
+
+                        ToolChip {
+                            title: "⚓ Anchor";
+                            tool-id: "anchor";
+                            selected-id: root.selected-building;
+                            hint: "Anchor: зафиксировать здание — оптимизатор его не двигает. Выберите режим и кликайте по зданиям на карте, ПКМ — выход.";
+                            selected(id) => {
+                                canvas-key-scope.focus();
+                                root.select-building(id);
+                            }
+                            hovered(h) => { root.optimizer-hint = h; }
+                        }
+
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                    }
+
+                    // Optimize Layout и Stop на одном уровне.
                     HorizontalBox {
                         spacing: 6px;
                         padding: 0px;
@@ -2144,25 +2249,81 @@ export component MainWindow inherits Window {
                         max-height: 34px;
 
                         PrimaryActionButton {
-                            width: 160px;
+                            width: 150px;
                             title: root.optimizer-running ? "Optimizing..." : "Optimize Layout";
                             pressed => { if !root.optimizer-running { root.run-optimizer(); } }
                         }
                         Button {
-                            min-width: 80px;
-                            max-width: 80px;
+                            min-width: 70px;
+                            max-width: 70px;
                             text: "Stop";
                             enabled: root.optimizer-running;
                             clicked => { root.stop-optimizer(); }
                         }
-                        Button {
-                            min-width: 100px;
-                            max-width: 100px;
-                            text: "Apply best";
-                            clicked => { root.apply-optimizer-best(); }
-                        }
 
                         Rectangle { horizontal-stretch: 1; background: transparent; }
+                    }
+
+                    // Группа в рамке: Apply / Cancel вместе с вариантами.
+                    Rectangle {
+                        min-height: 92px;
+                        max-height: 92px;
+                        border-width: 1px;
+                        border-color: #d3d9e2;
+                        border-radius: 6px;
+                        background: #fbfcfe;
+
+                        VerticalBox {
+                            padding: 6px;
+                            spacing: 4px;
+
+                            HorizontalBox {
+                                spacing: 6px;
+                                padding: 0px;
+                                min-height: 28px;
+                                max-height: 28px;
+
+                                Button {
+                                    min-width: 80px;
+                                    max-width: 80px;
+                                    text: "Apply";
+                                    enabled: root.optimizer-selected-candidate >= 0 && !root.optimizer-running;
+                                    clicked => { root.apply-optimizer-candidate(); }
+                                }
+                                Button {
+                                    min-width: 80px;
+                                    max-width: 80px;
+                                    text: "Cancel";
+                                    enabled: root.optimizer-selected-candidate >= 0;
+                                    clicked => { root.close-optimizer-candidate(); }
+                                }
+
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                            }
+
+                            HorizontalBox {
+                                spacing: 6px;
+                                padding: 0px;
+                                min-height: 46px;
+                                max-height: 46px;
+
+                                for candidate[index] in root.optimizer-candidates: CandidateCard {
+                                    title: candidate.title;
+                                    detail: candidate.detail;
+                                    active: index == root.optimizer-selected-candidate;
+                                    control-enabled: !root.optimizer-running;
+                                    pressed => { root.select-optimizer-candidate(index); }
+                                }
+
+                                if root.optimizer-candidates.length == 0: Text {
+                                    horizontal-stretch: 1;
+                                    text: "Варианты появятся здесь во время оптимизации (до 3)";
+                                    font-size: 11px;
+                                    color: #64748b;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
                     }
 
                     Text {

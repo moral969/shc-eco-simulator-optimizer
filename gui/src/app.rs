@@ -8,11 +8,13 @@ use std::{
 use simulator::{
     BREAD_SELL_GOLD, BuildingType, FLOUR_BUY_GOLD, FLOUR_SELL_GOLD, WHEAT_BUY_GOLD,
     WHEAT_SELL_GOLD, WOOD_BUY_GOLD, WeaponType, Optimizer, OptimizerConfig, OptimizerEvent, OptimizerHandle,
+    OptimizationResult,
 };
+
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::{
-    MainWindow, QuickStat, QuickStatOption, SimulationCycleItem, SimulationInfoLine,
+    MainWindow, QuickStat, QuickStatOption, OptimizerCandidate, SimulationCycleItem, SimulationInfoLine,
     backend::{BackendCommand, BackendHandle, BackendUpdate},
     editor_state::{EditorState, PlacementOutcome},
     project_files::ProjectSession,
@@ -188,11 +190,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .lock()
                 .expect("editor state lock should not be poisoned");
             if state.timeline_previewing() {
-                refresh_geometry_view(
-                    &window,
-                    &state,
-                    "Timeline preview: move to the last step to edit the map",
-                );
+                let message = if state.candidate_open() {
+                    "Optimizer variant preview: press Apply or Cancel to edit the map"
+                } else {
+                    "Timeline preview: move to the last step to edit the map"
+                };
+                refresh_geometry_view(&window, &state, message);
                 return;
             }
             match state.place_selected(x, y, remove_whole_wall) {
@@ -825,6 +828,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ---------------- Optimizer ----------------
     let optimizer_slot: Rc<RefCell<Option<OptimizerHandle>>> = Rc::new(RefCell::new(None));
     let optimizer_log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    // Топ вариантов (до 3) живёт только в памяти: файлы не пишутся, после Apply список очищается.
+    let optimizer_candidates: Rc<RefCell<Vec<OptimizationResult>>> =
+        Rc::new(RefCell::new(Vec::new()));
 
     let weak_window = window.as_weak();
     window.on_set_optimizer_iterations(move |text| {
@@ -841,7 +847,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let weak_window = window.as_weak();
     window.on_set_optimizer_top_solutions(move |text| {
         if let (Some(w), Some(v)) = (weak_window.upgrade(), parse_positive(text.as_str())) {
-            w.set_optimizer_top_solutions(v);
+            w.set_optimizer_top_solutions(v.min(3));
         }
     });
     let weak_window = window.as_weak();
@@ -866,15 +872,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let state = Arc::clone(&state);
         let slot = Rc::clone(&optimizer_slot);
         let log = Rc::clone(&optimizer_log);
+        let candidates = Rc::clone(&optimizer_candidates);
         window.on_run_optimizer(move || {
             let Some(window) = weak_window.upgrade() else { return };
             if slot.borrow().is_some() {
                 return;
             }
             let (layout, settings, population) = {
-                let guard = state
+                let mut guard = state
                     .lock()
                     .expect("editor state lock should not be poisoned");
+                // Открытый просмотр варианта закрываем: оптимизатор работает с текущей картой.
+                if guard.candidate_open() {
+                    guard.set_candidate(None);
+                    refresh_geometry_view(&window, &guard, "Optimizer started");
+                }
                 (
                     guard.simulator().clone(),
                     guard.simulation_settings(),
@@ -884,13 +896,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let config = OptimizerConfig {
                 max_iterations: window.get_optimizer_iterations().max(1) as usize,
                 threads: window.get_optimizer_threads().max(1) as usize,
-                top_n: window.get_optimizer_top_solutions().max(1) as usize,
+                top_n: window.get_optimizer_top_solutions().clamp(1, 3) as usize,
                 max_walls: window.get_optimizer_max_walls().max(0) as usize,
                 stockpile_clearance: window.get_optimizer_stock_gap(),
                 keep_groups: window.get_optimizer_keep_groups(),
                 max_cluster_size: window.get_optimizer_max_cluster().max(0) as usize,
+                save_to_disk: false,
                 ..OptimizerConfig::default()
             };
+            candidates.borrow_mut().clear();
+            window.set_optimizer_selected_candidate(-1);
+            refresh_optimizer_candidates(&window, &[]);
             *slot.borrow_mut() = Some(Optimizer::start(config, settings, population, layout));
             log.borrow_mut().clear();
             window.set_optimizer_log("".into());
@@ -908,15 +924,81 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Просмотр варианта: карта и таймлайн показывают его, текущая расстановка не трогается.
+    {
+        let weak_window = window.as_weak();
+        let state = Arc::clone(&state);
+        let slot = Rc::clone(&optimizer_slot);
+        let candidates = Rc::clone(&optimizer_candidates);
+        window.on_select_optimizer_candidate(move |index| {
+            let Some(window) = weak_window.upgrade() else { return };
+            if slot.borrow().is_some() {
+                return;
+            }
+            let Some(candidate) = usize::try_from(index)
+                .ok()
+                .and_then(|i| candidates.borrow().get(i).cloned())
+            else {
+                return;
+            };
+            let simulator = match candidate.project.into_simulator() {
+                Ok((simulator, _, _)) => simulator,
+                Err(error) => {
+                    window.set_status_text(format!("Некорректный вариант: {error}").into());
+                    return;
+                }
+            };
+            let mut guard = state
+                .lock()
+                .expect("editor state lock should not be poisoned");
+            guard.set_candidate(Some(simulator));
+            window.set_optimizer_selected_candidate(index);
+            window.set_simulation_tooltip_visible(false);
+            refresh_geometry_view(
+                &window,
+                &guard,
+                &format!("Variant {} preview: use the timeline, then press Apply", index + 1),
+            );
+        });
+    }
+
+    {
+        let weak_window = window.as_weak();
+        let state = Arc::clone(&state);
+        window.on_close_optimizer_candidate(move || {
+            let Some(window) = weak_window.upgrade() else { return };
+            let mut guard = state
+                .lock()
+                .expect("editor state lock should not be poisoned");
+            guard.set_candidate(None);
+            window.set_optimizer_selected_candidate(-1);
+            refresh_geometry_view(&window, &guard, "Variant preview closed");
+        });
+    }
+
     {
         let weak_window = window.as_weak();
         let state = Arc::clone(&state);
         let backend = backend.clone();
-        window.on_apply_optimizer_best(move || {
-            if let Some(window) = weak_window.upgrade() {
-                let path = OptimizerConfig::default().output_dir.join("top_01.json");
-                apply_optimizer_best(&window, &state, &backend, &path);
+        let slot = Rc::clone(&optimizer_slot);
+        let candidates = Rc::clone(&optimizer_candidates);
+        window.on_apply_optimizer_candidate(move || {
+            let Some(window) = weak_window.upgrade() else { return };
+            if slot.borrow().is_some() {
+                return;
             }
+            let Some(candidate) = usize::try_from(window.get_optimizer_selected_candidate())
+                .ok()
+                .and_then(|i| candidates.borrow().get(i).cloned())
+            else {
+                window.set_status_text("Select a variant first".into());
+                return;
+            };
+            apply_optimizer_candidate(&window, &state, &backend, candidate.project);
+            // Применённый вариант больше не нужен: список очищается, файлов нет.
+            candidates.borrow_mut().clear();
+            window.set_optimizer_selected_candidate(-1);
+            refresh_optimizer_candidates(&window, &[]);
         });
     }
 
@@ -926,6 +1008,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let weak_window = window.as_weak();
         let slot = Rc::clone(&optimizer_slot);
         let log = Rc::clone(&optimizer_log);
+        let candidates = Rc::clone(&optimizer_candidates);
         optimizer_timer.start(
             slint::TimerMode::Repeated,
             std::time::Duration::from_millis(250),
@@ -959,20 +1042,24 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     .into(),
                                 );
                             }
+                            Ok(OptimizerEvent::Solutions(list)) => {
+                                // Варианты берём прямо из памяти, без файлов.
+                                refresh_optimizer_candidates(&window, &list);
+                                *candidates.borrow_mut() = list;
+                            }
                             Ok(OptimizerEvent::Finished {
                                 best,
                                 evaluated,
                                 elapsed_s,
-                                output_dir,
+                                ..
                             }) => {
                                 log.borrow_mut().insert(
                                     0,
                                     format!(
-                                        "Готово: лучшее {} gold/min, оценок {}, {:.0} с. Файлы: {}",
+                                        "Готово: лучшее {} gold/min, оценок {}, {:.0} с. Выберите вариант и нажмите Apply.",
                                         best.map_or("-".to_string(), |b| format!("{b:.2}")),
                                         evaluated,
-                                        elapsed_s,
-                                        output_dir.display()
+                                        elapsed_s
                                     ),
                                 );
                                 log_changed = true;
@@ -1123,23 +1210,33 @@ fn parse_positive(text: &str) -> Option<i32> {
     text.trim().parse::<i32>().ok().filter(|v| *v > 0)
 }
 
-fn apply_optimizer_best(
+fn refresh_optimizer_candidates(window: &MainWindow, candidates: &[OptimizationResult]) {
+    let items = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| OptimizerCandidate {
+            title: format!(
+                "Variant {} - {:.2} gold/min",
+                index + 1,
+                candidate.gold_per_minute
+            )
+            .into(),
+            detail: format!(
+                "wall attempts: {} | thread #{} | iteration {}",
+                candidate.walls_used, candidate.worker, candidate.iteration
+            )
+            .into(),
+        })
+        .collect::<Vec<_>>();
+    window.set_optimizer_candidates(ModelRc::new(VecModel::from(items)));
+}
+
+fn apply_optimizer_candidate(
     window: &MainWindow,
     state: &Arc<Mutex<EditorState>>,
     backend: &BackendHandle,
-    path: &std::path::Path,
+    project: simulator::ProjectFile,
 ) {
-    let project = match std::fs::read_to_string(path)
-        .map_err(|e| e.to_string())
-        .and_then(|json| {
-            serde_json::from_str::<simulator::ProjectFile>(&json).map_err(|e| e.to_string())
-        }) {
-        Ok(project) => project,
-        Err(error) => {
-            window.set_status_text(format!("Не удалось прочитать {}: {error}", path.display()).into());
-            return;
-        }
-    };
     let (layout, settings, population) = match project.into_simulator() {
         Ok(v) => v,
         Err(error) => {
@@ -1157,11 +1254,12 @@ fn apply_optimizer_best(
     let mut guard = state
         .lock()
         .expect("editor state lock should not be poisoned");
+    guard.set_candidate(None);
     guard.set_simulation_settings(settings);
     guard.set_population_economy_settings(population);
     guard.mark_simulation_results_stale();
     guard.clear_selection();
-    refresh_geometry_view(window, &guard, "Лучшее решение оптимизатора загружено, пересчёт...");
+    refresh_geometry_view(window, &guard, "Вариант применён, пересчёт...");
 }
 
 fn parse_count(text: &str, label: &str) -> Result<u32, String> {

@@ -58,6 +58,9 @@ pub struct OptimizerConfig {
     pub initial_temperature: f64,
     pub final_temperature: f64,
     pub output_dir: PathBuf,
+    /// true — топ решений дополнительно пишется в output_dir (top_NN.json, report.json).
+    /// GUI ставит false и забирает варианты из OptimizerEvent::Solutions.
+    pub save_to_disk: bool,
 }
 
 impl Default for OptimizerConfig {
@@ -78,6 +81,7 @@ impl Default for OptimizerConfig {
             initial_temperature: 30.0,
             final_temperature: 0.5,
             output_dir: PathBuf::from("optimizer_results"),
+            save_to_disk: true,
         }
     }
 }
@@ -127,6 +131,8 @@ pub struct OptimizationResult {
 #[derive(Debug, Clone)]
 pub enum OptimizerEvent {
     Log(String),
+    /// Текущий топ решений (по убыванию score), целиком из памяти.
+    Solutions(Vec<OptimizationResult>),
     Progress {
         elapsed_s: f64,
         evaluated: u64,
@@ -258,10 +264,13 @@ impl Shared {
         }
         let build_order = normalize_plan(plan);
         let mut project = ProjectFile::capture(sim, self.settings, self.population);
+        // Оставленные стены без мастерских в плане тоже должны попасть в журнал.
+        let orphans = orphan_wall_steps(sim, &self.fixed_steps, &build_order);
         project.build_sequence = self
             .fixed_steps
             .iter()
             .cloned()
+            .chain(orphans)
             .chain(plan_steps(&build_order))
             .collect();
         let entry = Entry {
@@ -281,6 +290,48 @@ impl Shared {
             .unwrap_or_else(|e| e.into_inner())
             .offer(entry);
     }
+}
+
+/// Оставленные стены (kept), которых нет ни в неподвижной части, ни среди шагов плана:
+/// их мастерские потом переехали, а стена в расстановке осталась. Без этих шагов журнал
+/// не воспроизводит итоговую карту, и «лишние» стены появляются на последнем шаге таймлайна.
+fn orphan_wall_steps(sim: &Simulator, fixed: &[BuildStep], plan: &[PlanStep]) -> Vec<BuildStep> {
+    let key = |sx: i32, sy: i32, ex: i32, ey: i32| (sx.min(ex), sy.min(ey), sx.max(ex), sy.max(ey));
+    let mut known: Vec<(i32, i32, i32, i32)> = fixed
+        .iter()
+        .filter_map(|step| match step {
+            BuildStep::Wall {
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+            } => Some(key(*start_x, *start_y, *end_x, *end_y)),
+            _ => None,
+        })
+        .collect();
+    let mut groups = HashSet::new();
+    for wall in plan.iter().filter_map(|s| s.wall.as_ref()).filter(|w| w.kept) {
+        if groups.insert(wall.group) {
+            known.push(key(wall.sx, wall.sy, wall.ex, wall.ey));
+        }
+    }
+
+    let mut orphans = Vec::new();
+    for wall in sim.walls() {
+        let wall_key = key(wall.start_x, wall.start_y, wall.end_x, wall.end_y);
+        match known.iter().position(|k| *k == wall_key) {
+            Some(pos) => {
+                known.swap_remove(pos);
+            }
+            None => orphans.push(BuildStep::Wall {
+                start_x: wall.start_x,
+                start_y: wall.start_y,
+                end_x: wall.end_x,
+                end_y: wall.end_y,
+            }),
+        }
+    }
+    orphans
 }
 
 fn layout_keys(sim: &Simulator) -> HashSet<String> {
@@ -1508,6 +1559,8 @@ fn coordinator(
         if cfg.stockpile_clearance { "вкл" } else { "выкл" }
     )));
 
+    let save_to_disk = cfg.save_to_disk;
+
     let shared = Arc::new(Shared {
         archive: Mutex::new(Archive {
             entries: Vec::new(),
@@ -1553,9 +1606,15 @@ fn coordinator(
                 }
             }
             if a.dirty && (finished || last_save.elapsed() > Duration::from_secs(2)) {
-                if let Err(error) = save_archive(&dir, &a.entries) {
-                    send(OptimizerEvent::Log(format!("ошибка сохранения: {error}")));
+                if save_to_disk {
+                    if let Err(error) = save_archive(&dir, &a.entries) {
+                        send(OptimizerEvent::Log(format!("ошибка сохранения: {error}")));
+                    }
                 }
+                // Варианты уходят в GUI прямо из памяти.
+                send(OptimizerEvent::Solutions(
+                    a.entries.iter().map(|e| e.result.clone()).collect(),
+                ));
                 a.dirty = false;
                 last_save = Instant::now();
             }
